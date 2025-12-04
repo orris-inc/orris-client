@@ -1,7 +1,7 @@
 # Makefile for Orris Agent
 
 # Variables
-BINARY_NAME=orris-agent
+BINARY_NAME=orris-client
 VERSION?=dev
 BUILD_TIME=$(shell date -u '+%Y-%m-%d_%H:%M:%S')
 LDFLAGS=-ldflags "-X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}"
@@ -14,7 +14,7 @@ all: build
 .PHONY: build
 build:
 	@echo "Building ${BINARY_NAME}..."
-	@go build ${LDFLAGS} -o bin/${BINARY_NAME} ./cmd/orris-agent
+	@go build ${LDFLAGS} -o bin/${BINARY_NAME} ./cmd/orris-client
 	@echo "Build complete: bin/${BINARY_NAME}"
 
 # Clean
@@ -65,7 +65,7 @@ endif
 .PHONY: build-upx
 build-upx:
 	@echo "Building ${BINARY_NAME} with UPX compression..."
-	@go build ${LDFLAGS} -o bin/${BINARY_NAME} ./cmd/orris-agent
+	@go build ${LDFLAGS} -o bin/${BINARY_NAME} ./cmd/orris-client
 	@echo "Compressing with UPX..."
 	@upx ${UPX_FLAGS} bin/${BINARY_NAME}
 	@echo "Build complete: bin/${BINARY_NAME} (compressed)"
@@ -74,7 +74,7 @@ build-upx:
 .PHONY: release
 release:
 	@echo "Building release ${BINARY_NAME}..."
-	@go build -ldflags "-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" -o bin/${BINARY_NAME} ./cmd/orris-agent
+	@go build -ldflags "-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" -o bin/${BINARY_NAME} ./cmd/orris-client
 	@echo "Compressing with UPX..."
 	@upx ${UPX_FLAGS} bin/${BINARY_NAME}
 	@echo "Release build complete: bin/${BINARY_NAME}"
@@ -83,21 +83,21 @@ release:
 .PHONY: build-linux
 build-linux:
 	@echo "Building ${BINARY_NAME} for Linux amd64..."
-	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${LDFLAGS} -o bin/${BINARY_NAME}-linux-amd64 ./cmd/orris-agent
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${LDFLAGS} -o bin/${BINARY_NAME}-linux-amd64 ./cmd/orris-client
 	@echo "Build complete: bin/${BINARY_NAME}-linux-amd64"
 
 # Build for Linux arm64
 .PHONY: build-linux-arm64
 build-linux-arm64:
 	@echo "Building ${BINARY_NAME} for Linux arm64..."
-	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ${LDFLAGS} -o bin/${BINARY_NAME}-linux-arm64 ./cmd/orris-agent
+	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ${LDFLAGS} -o bin/${BINARY_NAME}-linux-arm64 ./cmd/orris-client
 	@echo "Build complete: bin/${BINARY_NAME}-linux-arm64"
 
 # Build Linux with UPX compression
 .PHONY: build-linux-upx
 build-linux-upx:
 	@echo "Building ${BINARY_NAME} for Linux amd64 with UPX..."
-	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" -o bin/${BINARY_NAME}-linux-amd64 ./cmd/orris-agent
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" -o bin/${BINARY_NAME}-linux-amd64 ./cmd/orris-client
 	@echo "Compressing with UPX..."
 	@upx --best --lzma bin/${BINARY_NAME}-linux-amd64
 	@echo "Build complete: bin/${BINARY_NAME}-linux-amd64 (compressed)"
@@ -106,7 +106,7 @@ build-linux-upx:
 .PHONY: build-linux-arm64-upx
 build-linux-arm64-upx:
 	@echo "Building ${BINARY_NAME} for Linux arm64 with UPX..."
-	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" -o bin/${BINARY_NAME}-linux-arm64 ./cmd/orris-agent
+	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" -o bin/${BINARY_NAME}-linux-arm64 ./cmd/orris-client
 	@echo "Compressing with UPX..."
 	@upx --best --lzma bin/${BINARY_NAME}-linux-arm64
 	@echo "Build complete: bin/${BINARY_NAME}-linux-arm64 (compressed)"

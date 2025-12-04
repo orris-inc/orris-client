@@ -5,7 +5,7 @@ error() { echo -e "\033[31m\033[01m$*\033[0m" && exit 1; }
 info() { echo -e "\033[32m\033[01m$*\033[0m"; }
 hint() { echo -e "\033[33m\033[01m$*\033[0m"; }
 
-SERVICE_NAME="orris-agent"
+SERVICE_NAME="orris-client"
 INSTALL_DIR="/opt/${SERVICE_NAME}"
 
 if [ -z "$DOWNLOAD_HOST" ]; then
