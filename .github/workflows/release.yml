@@ -23,6 +23,11 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      - name: Install UPX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y upx
+
       - name: Build binaries
         run: |
           mkdir -p dist
@@ -32,6 +37,13 @@ jobs:
             GOARCH="${platform#*/}"
             echo "Building for ${GOOS}/${GOARCH}..."
             GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" -o dist/orris-client-${GOOS}-${GOARCH} ./cmd/orris-client
+          done
+
+      - name: Compress with UPX
+        run: |
+          for file in dist/orris-client-linux-*; do
+            echo "Compressing ${file}..."
+            upx --best --lzma "${file}" || true
           done
 
       - name: Create checksums
