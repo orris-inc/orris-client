@@ -5,7 +5,7 @@
 *.so
 *.dylib
 *.test
-orris-agent
+/orris-client
 
 # Build output
 bin/

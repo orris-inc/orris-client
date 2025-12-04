@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        goos: [linux, darwin, windows]
+        goos: [linux, darwin]
         goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
@@ -68,15 +68,10 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-        run: |
-          output="orris-agent-${{ matrix.goos }}-${{ matrix.goarch }}"
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            output="${output}.exe"
-          fi
-          go build -o ${output} ./cmd/orris-agent
+        run: go build -o orris-client-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/orris-client
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: orris-agent-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: orris-agent-*
+          name: orris-client-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: orris-client-*
