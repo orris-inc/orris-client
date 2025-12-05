@@ -10,6 +10,7 @@ type Config struct {
 	Token           string
 	SyncInterval    time.Duration
 	TrafficInterval time.Duration
+	StatusInterval  time.Duration
 	HTTPTimeout     time.Duration
 }
 
@@ -19,6 +20,7 @@ func DefaultConfig() *Config {
 		Token:           "",
 		SyncInterval:    30 * time.Second,
 		TrafficInterval: 60 * time.Second,
+		StatusInterval:  30 * time.Second,
 		HTTPTimeout:     10 * time.Second,
 	}
 }
