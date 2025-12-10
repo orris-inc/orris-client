@@ -187,7 +187,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 		switch rule.Role {
 		case "entry":
 			// Chain entry: connect to next hop
-			t, err := a.getOrCreateTunnelByAddress(rule.NextHopAddress, rule.NextHopWsPort)
+			t, err := a.getOrCreateTunnelByAddress(rule.NextHopAddress, rule.NextHopWsPort, rule.NextHopConnectionToken)
 			if err != nil {
 				return fmt.Errorf("create tunnel to next hop: %w", err)
 			}
@@ -206,7 +206,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			}
 
 			// Connect to next hop
-			t, err := a.getOrCreateTunnelByAddress(rule.NextHopAddress, rule.NextHopWsPort)
+			t, err := a.getOrCreateTunnelByAddress(rule.NextHopAddress, rule.NextHopWsPort, rule.NextHopConnectionToken)
 			if err != nil {
 				return fmt.Errorf("create tunnel to next hop: %w", err)
 			}
@@ -261,7 +261,8 @@ func (a *Agent) getOrCreateTunnel(exitAgentID string) (*tunnel.Client, error) {
 	}
 
 	wsURL := fmt.Sprintf("ws://%s:%d/tunnel", endpoint.Address, endpoint.WsPort)
-	t := tunnel.NewClient(wsURL, a.cfg.Token,
+	// Use ConnectionToken from API for agent-to-agent authentication
+	t := tunnel.NewClient(wsURL, endpoint.ConnectionToken,
 		tunnel.WithReconnectInterval(5*time.Second),
 		tunnel.WithHeartbeatInterval(30*time.Second),
 	)
@@ -275,7 +276,8 @@ func (a *Agent) getOrCreateTunnel(exitAgentID string) (*tunnel.Client, error) {
 }
 
 // getOrCreateTunnelByAddress creates a tunnel connection to a specific address.
-func (a *Agent) getOrCreateTunnelByAddress(address string, wsPort uint16) (*tunnel.Client, error) {
+// connectionToken is the JWT token for agent-to-agent authentication.
+func (a *Agent) getOrCreateTunnelByAddress(address string, wsPort uint16, connectionToken string) (*tunnel.Client, error) {
 	key := fmt.Sprintf("%s:%d", address, wsPort)
 
 	a.tunnelsMu.Lock()
@@ -286,7 +288,7 @@ func (a *Agent) getOrCreateTunnelByAddress(address string, wsPort uint16) (*tunn
 	}
 
 	wsURL := fmt.Sprintf("ws://%s:%d/tunnel", address, wsPort)
-	t := tunnel.NewClient(wsURL, a.cfg.Token,
+	t := tunnel.NewClient(wsURL, connectionToken,
 		tunnel.WithReconnectInterval(5*time.Second),
 		tunnel.WithHeartbeatInterval(30*time.Second),
 	)
@@ -306,7 +308,7 @@ func (a *Agent) ensureTunnelServer() error {
 		return nil
 	}
 
-	a.tunnelServer = tunnel.NewServer(a.cfg.WsListenPort, a.cfg.Token)
+	a.tunnelServer = tunnel.NewServer(a.cfg.WsListenPort)
 	if err := a.tunnelServer.Start(a.ctx); err != nil {
 		return fmt.Errorf("start tunnel server: %w", err)
 	}

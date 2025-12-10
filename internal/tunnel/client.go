@@ -92,9 +92,15 @@ func (c *Client) Stop() error {
 	if c.cancel != nil {
 		c.cancel()
 	}
+
+	// Hold write lock before closing to prevent concurrent write
+	c.writeMu.Lock()
 	if c.conn != nil {
 		c.conn.Close()
+		c.conn = nil
 	}
+	c.writeMu.Unlock()
+
 	c.wg.Wait()
 	logger.Info("tunnel client stopped")
 	return nil
@@ -141,7 +147,17 @@ func (c *Client) connect() error {
 		return fmt.Errorf("dial: %w", err)
 	}
 
+	// Hold write lock when updating connection
+	c.writeMu.Lock()
+	oldConn := c.conn
 	c.conn = conn
+	c.writeMu.Unlock()
+
+	// Close old connection if exists (during reconnect)
+	if oldConn != nil {
+		oldConn.Close()
+	}
+
 	logger.Info("connected to exit agent")
 	return nil
 }

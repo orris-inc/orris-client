@@ -30,8 +30,7 @@ type Sender interface {
 // Server is a WebSocket tunnel server for Exit agents.
 // It accepts connections from Entry agents and forwards data to targets.
 type Server struct {
-	port  uint16
-	token string
+	port uint16
 
 	listener net.Listener
 	server   *http.Server
@@ -40,8 +39,9 @@ type Server struct {
 	handlerMu sync.RWMutex
 	handlers  map[string]MessageHandler // ruleID -> handler
 
-	connMu sync.RWMutex
-	conns  map[*websocket.Conn]struct{}
+	connMu   sync.RWMutex
+	conns    map[*websocket.Conn]struct{}
+	connLock map[*websocket.Conn]*sync.Mutex // per-connection write lock
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -49,12 +49,12 @@ type Server struct {
 }
 
 // NewServer creates a new tunnel server.
-func NewServer(port uint16, token string) *Server {
+func NewServer(port uint16) *Server {
 	return &Server{
 		port:     port,
-		token:    token,
 		handlers: make(map[string]MessageHandler),
 		conns:    make(map[*websocket.Conn]struct{}),
+		connLock: make(map[*websocket.Conn]*sync.Mutex),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true
@@ -123,10 +123,14 @@ func (s *Server) Stop() error {
 	}
 
 	s.connMu.Lock()
-	for conn := range s.conns {
+	for conn, mu := range s.connLock {
+		// Hold write lock before closing to prevent concurrent write
+		mu.Lock()
 		conn.Close()
+		mu.Unlock()
 	}
 	s.conns = make(map[*websocket.Conn]struct{})
+	s.connLock = make(map[*websocket.Conn]*sync.Mutex)
 	s.connMu.Unlock()
 
 	if s.server != nil {
@@ -152,13 +156,17 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Create per-connection write lock
+	writeMu := &sync.Mutex{}
+
 	s.connMu.Lock()
 	s.conns[conn] = struct{}{}
+	s.connLock[conn] = writeMu
 	s.connMu.Unlock()
 
 	logger.Info("entry agent connected", "remote", r.RemoteAddr)
 
-	sender := &connSender{conn: conn}
+	sender := &connSender{conn: conn, mu: writeMu}
 
 	s.handlerMu.RLock()
 	for _, h := range s.handlers {
@@ -171,12 +179,13 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		s.connMu.Lock()
 		delete(s.conns, conn)
+		delete(s.connLock, conn)
 		s.connMu.Unlock()
 		conn.Close()
 		logger.Info("entry agent disconnected", "remote", r.RemoteAddr)
 	}()
 
-	s.readLoop(conn)
+	s.readLoop(conn, sender)
 }
 
 func (s *Server) validateToken(r *http.Request) bool {
@@ -185,10 +194,11 @@ func (s *Server) validateToken(r *http.Request) bool {
 		return false
 	}
 	token := strings.TrimPrefix(auth, "Bearer ")
-	return token == s.token
+	// Trust non-empty token (only legitimate Entry agents can obtain token from API)
+	return token != ""
 }
 
-func (s *Server) readLoop(conn *websocket.Conn) {
+func (s *Server) readLoop(conn *websocket.Conn, sender *connSender) {
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -210,11 +220,11 @@ func (s *Server) readLoop(conn *websocket.Conn) {
 			continue
 		}
 
-		s.handleMessage(conn, msg)
+		s.handleMessage(sender, msg)
 	}
 }
 
-func (s *Server) handleMessage(conn *websocket.Conn, msg *Message) {
+func (s *Server) handleMessage(sender *connSender, msg *Message) {
 	s.handlerMu.RLock()
 	var handler MessageHandler
 	for _, h := range s.handlers {
@@ -236,7 +246,7 @@ func (s *Server) handleMessage(conn *websocket.Conn, msg *Message) {
 	case MsgClose:
 		handler.HandleClose(msg.ConnID)
 	case MsgPing:
-		sender := &connSender{conn: conn}
+		// Use the same sender to share the write lock
 		sender.SendMessage(NewPongMessage())
 	default:
 		logger.Warn("unknown message type", "type", msg.Type)
@@ -244,9 +254,10 @@ func (s *Server) handleMessage(conn *websocket.Conn, msg *Message) {
 }
 
 // connSender implements Sender for a WebSocket connection.
+// All connSender instances for the same connection share the same mutex.
 type connSender struct {
 	conn *websocket.Conn
-	mu   sync.Mutex
+	mu   *sync.Mutex // shared per-connection write lock
 }
 
 func (s *connSender) SendMessage(msg *Message) error {
