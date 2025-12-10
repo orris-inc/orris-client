@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ type Server struct {
 	port  uint16
 	token string
 
+	listener net.Listener
 	server   *http.Server
 	upgrader websocket.Upgrader
 
@@ -76,14 +78,24 @@ func (s *Server) RemoveHandler(ruleID string) {
 }
 
 // Start starts the tunnel server.
+// If port is 0, a random available port will be used.
 func (s *Server) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
+
+	// Create listener first to get the actual port (supports port 0 for random)
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.port))
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	s.listener = listener
+
+	// Update port with the actual port (important when port was 0)
+	s.port = uint16(listener.Addr().(*net.TCPAddr).Port)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tunnel", s.handleTunnel)
 
 	s.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.port),
 		Handler: mux,
 	}
 
@@ -91,12 +103,17 @@ func (s *Server) Start(ctx context.Context) error {
 	go func() {
 		defer s.wg.Done()
 		logger.Info("tunnel server started", "port", s.port)
-		if err := s.server.ListenAndServe(); err != http.ErrServerClosed {
+		if err := s.server.Serve(s.listener); err != http.ErrServerClosed {
 			logger.Error("tunnel server error", "error", err)
 		}
 	}()
 
 	return nil
+}
+
+// Port returns the actual listening port.
+func (s *Server) Port() uint16 {
+	return s.port
 }
 
 // Stop stops the tunnel server.
