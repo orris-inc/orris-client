@@ -14,8 +14,9 @@ import (
 
 func main() {
 	var (
-		serverURL = flag.StringP("server", "u", "", "server URL")
-		token     = flag.StringP("token", "t", "", "bearer token")
+		serverURL    = flag.StringP("server", "u", "", "server URL")
+		token        = flag.StringP("token", "t", "", "bearer token")
+		wsListenPort = flag.Uint16P("ws-port", "w", 0, "WebSocket listen port for tunnel (0 = random)")
 	)
 	flag.Parse()
 
@@ -26,6 +27,9 @@ func main() {
 	}
 	if *token != "" {
 		cfg.Token = *token
+	}
+	if *wsListenPort != 0 {
+		cfg.WsListenPort = *wsListenPort
 	}
 
 	if cfg.Token == "" {

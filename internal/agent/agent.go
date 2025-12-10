@@ -149,32 +149,91 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 		f = df
 
 	case forward.RuleTypeEntry:
-		t, err := a.getOrCreateTunnel(rule.ExitAgentID)
-		if err != nil {
-			return fmt.Errorf("create tunnel: %w", err)
-		}
-
-		ef := forwarder.NewEntryForwarder(rule, t)
-		t.SetHandler(ef)
-		if err := ef.Start(a.ctx); err != nil {
-			return err
-		}
-		f = ef
-
-	case forward.RuleTypeExit:
-		if a.tunnelServer == nil {
-			a.tunnelServer = tunnel.NewServer(rule.WsListenPort, a.cfg.Token)
-			if err := a.tunnelServer.Start(a.ctx); err != nil {
-				return fmt.Errorf("start tunnel server: %w", err)
+		// Handle based on agent's role in this rule
+		switch rule.Role {
+		case "entry":
+			// Entry role: establish tunnel to exit agent
+			t, err := a.getOrCreateTunnel(rule.ExitAgentID)
+			if err != nil {
+				return fmt.Errorf("create tunnel: %w", err)
 			}
+
+			ef := forwarder.NewEntryForwarder(rule, t)
+			t.SetHandler(ef)
+			if err := ef.Start(a.ctx); err != nil {
+				return err
+			}
+			f = ef
+
+		case "exit":
+			// Exit role: accept tunnel connections and forward to target
+			if err := a.ensureTunnelServer(); err != nil {
+				return err
+			}
+
+			ef := forwarder.NewExitForwarder(rule)
+			a.tunnelServer.AddHandler(rule.ID, ef)
+			if err := ef.Start(a.ctx); err != nil {
+				return err
+			}
+			f = ef
+
+		default:
+			return fmt.Errorf("unknown role %q for entry rule", rule.Role)
 		}
 
-		ef := forwarder.NewExitForwarder(rule)
-		a.tunnelServer.AddHandler(rule.ID, ef)
-		if err := ef.Start(a.ctx); err != nil {
-			return err
+	case forward.RuleTypeChain:
+		// Handle chain rule based on agent's role
+		switch rule.Role {
+		case "entry":
+			// Chain entry: connect to next hop
+			t, err := a.getOrCreateTunnelByAddress(rule.NextHopAddress, rule.NextHopWsPort)
+			if err != nil {
+				return fmt.Errorf("create tunnel to next hop: %w", err)
+			}
+
+			ef := forwarder.NewEntryForwarder(rule, t)
+			t.SetHandler(ef)
+			if err := ef.Start(a.ctx); err != nil {
+				return err
+			}
+			f = ef
+
+		case "relay":
+			// Chain relay: accept from previous hop, forward to next hop
+			if err := a.ensureTunnelServer(); err != nil {
+				return err
+			}
+
+			// Connect to next hop
+			t, err := a.getOrCreateTunnelByAddress(rule.NextHopAddress, rule.NextHopWsPort)
+			if err != nil {
+				return fmt.Errorf("create tunnel to next hop: %w", err)
+			}
+
+			rf := forwarder.NewRelayForwarder(rule, t)
+			a.tunnelServer.AddHandler(rule.ID, rf)
+			if err := rf.Start(a.ctx); err != nil {
+				return err
+			}
+			f = rf
+
+		case "exit":
+			// Chain exit: accept from previous hop, forward to target
+			if err := a.ensureTunnelServer(); err != nil {
+				return err
+			}
+
+			ef := forwarder.NewExitForwarder(rule)
+			a.tunnelServer.AddHandler(rule.ID, ef)
+			if err := ef.Start(a.ctx); err != nil {
+				return err
+			}
+			f = ef
+
+		default:
+			return fmt.Errorf("unknown role %q for chain rule", rule.Role)
 		}
-		f = ef
 
 	default:
 		return fmt.Errorf("unknown rule type: %s", rule.RuleType)
@@ -213,6 +272,49 @@ func (a *Agent) getOrCreateTunnel(exitAgentID string) (*tunnel.Client, error) {
 
 	a.tunnels[exitAgentID] = t
 	return t, nil
+}
+
+// getOrCreateTunnelByAddress creates a tunnel connection to a specific address.
+func (a *Agent) getOrCreateTunnelByAddress(address string, wsPort uint16) (*tunnel.Client, error) {
+	key := fmt.Sprintf("%s:%d", address, wsPort)
+
+	a.tunnelsMu.Lock()
+	defer a.tunnelsMu.Unlock()
+
+	if t, exists := a.tunnels[key]; exists {
+		return t, nil
+	}
+
+	wsURL := fmt.Sprintf("ws://%s:%d/tunnel", address, wsPort)
+	t := tunnel.NewClient(wsURL, a.cfg.Token,
+		tunnel.WithReconnectInterval(5*time.Second),
+		tunnel.WithHeartbeatInterval(30*time.Second),
+	)
+
+	if err := t.Start(a.ctx); err != nil {
+		return nil, fmt.Errorf("start tunnel: %w", err)
+	}
+
+	a.tunnels[key] = t
+	return t, nil
+}
+
+// ensureTunnelServer ensures the tunnel server is started.
+// If WsListenPort is 0, a random available port will be used.
+func (a *Agent) ensureTunnelServer() error {
+	if a.tunnelServer != nil {
+		return nil
+	}
+
+	a.tunnelServer = tunnel.NewServer(a.cfg.WsListenPort, a.cfg.Token)
+	if err := a.tunnelServer.Start(a.ctx); err != nil {
+		return fmt.Errorf("start tunnel server: %w", err)
+	}
+
+	// Update config with actual port (important when port was 0)
+	a.cfg.WsListenPort = a.tunnelServer.Port()
+
+	return nil
 }
 
 func (a *Agent) trafficLoop() {
@@ -274,6 +376,11 @@ func (a *Agent) reportStatus() {
 	a.tunnelsMu.RUnlock()
 
 	a.collector.SetTunnelStatus(st, tunnelStatus)
+
+	// Set WS listen port if configured (for exit/relay agents)
+	if a.cfg.WsListenPort > 0 {
+		st.WsListenPort = a.cfg.WsListenPort
+	}
 
 	if err := a.client.ReportStatus(a.ctx, st); err != nil {
 		logger.Error("report status failed", "error", err)
@@ -480,4 +587,3 @@ func (a *Agent) probeTunnelByRule(ruleID string) (bool, string) {
 	// For non-entry rules, just check if forwarder exists
 	return true, ""
 }
-
