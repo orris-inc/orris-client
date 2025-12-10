@@ -36,7 +36,7 @@ type Server struct {
 	upgrader websocket.Upgrader
 
 	handlerMu sync.RWMutex
-	handlers  map[uint]MessageHandler // ruleID -> handler
+	handlers  map[string]MessageHandler // ruleID -> handler
 
 	connMu sync.RWMutex
 	conns  map[*websocket.Conn]struct{}
@@ -51,7 +51,7 @@ func NewServer(port uint16, token string) *Server {
 	return &Server{
 		port:     port,
 		token:    token,
-		handlers: make(map[uint]MessageHandler),
+		handlers: make(map[string]MessageHandler),
 		conns:    make(map[*websocket.Conn]struct{}),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
@@ -62,14 +62,14 @@ func NewServer(port uint16, token string) *Server {
 }
 
 // AddHandler adds a message handler for a rule.
-func (s *Server) AddHandler(ruleID uint, handler MessageHandler) {
+func (s *Server) AddHandler(ruleID string, handler MessageHandler) {
 	s.handlerMu.Lock()
 	s.handlers[ruleID] = handler
 	s.handlerMu.Unlock()
 }
 
 // RemoveHandler removes a message handler.
-func (s *Server) RemoveHandler(ruleID uint) {
+func (s *Server) RemoveHandler(ruleID string) {
 	s.handlerMu.Lock()
 	delete(s.handlers, ruleID)
 	s.handlerMu.Unlock()

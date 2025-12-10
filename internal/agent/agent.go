@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
 	"sync"
@@ -24,16 +23,12 @@ type Agent struct {
 	collector *status.Collector
 
 	forwardersMu sync.RWMutex
-	forwarders   map[uint]forwarder.Forwarder
+	forwarders   map[string]forwarder.Forwarder
 
 	tunnelsMu sync.RWMutex
-	tunnels   map[uint]*tunnel.Client // exitAgentID -> tunnel
+	tunnels   map[string]*tunnel.Client // exitAgentID -> tunnel
 
 	tunnelServer *tunnel.Server
-
-	// Hub connection for WebSocket communication
-	hubMu   sync.RWMutex
-	hubConn *forward.HubConn
 
 	ctx      context.Context
 	cancelFn context.CancelFunc
@@ -47,8 +42,8 @@ func New(cfg *config.Config) *Agent {
 		cfg:        cfg,
 		client:     client,
 		collector:  status.NewCollector(),
-		forwarders: make(map[uint]forwarder.Forwarder),
-		tunnels:    make(map[uint]*tunnel.Client),
+		forwarders: make(map[string]forwarder.Forwarder),
+		tunnels:    make(map[string]*tunnel.Client),
 	}
 }
 
@@ -74,7 +69,6 @@ func (a *Agent) Stop() {
 	}
 
 	a.reportFinalTraffic()
-	a.closeHub()
 	a.stopAll()
 	a.wg.Wait()
 }
@@ -110,7 +104,7 @@ func (a *Agent) syncRules() error {
 
 	logger.Info("rules synced successfully", "count", len(rules))
 
-	ruleMap := make(map[uint]*forward.Rule)
+	ruleMap := make(map[string]*forward.Rule)
 	for i := range rules {
 		ruleMap[rules[i].ID] = &rules[i]
 	}
@@ -194,7 +188,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 	return nil
 }
 
-func (a *Agent) getOrCreateTunnel(exitAgentID uint) (*tunnel.Client, error) {
+func (a *Agent) getOrCreateTunnel(exitAgentID string) (*tunnel.Client, error) {
 	a.tunnelsMu.Lock()
 	defer a.tunnelsMu.Unlock()
 
@@ -269,7 +263,7 @@ func (a *Agent) reportStatus() {
 
 	// Set tunnel status
 	a.tunnelsMu.RLock()
-	tunnelStatus := make(map[uint]forward.TunnelState)
+	tunnelStatus := make(map[string]forward.TunnelState)
 	for exitAgentID, t := range a.tunnels {
 		if t.IsConnected() {
 			tunnelStatus[exitAgentID] = forward.TunnelStateConnected
@@ -281,29 +275,12 @@ func (a *Agent) reportStatus() {
 
 	a.collector.SetTunnelStatus(st, tunnelStatus)
 
-	// Try to send via Hub WebSocket first, fallback to HTTP
-	if conn := a.getHubConn(); conn != nil {
-		if err := conn.SendStatus(st); err != nil {
-			logger.Debug("hub send status failed, falling back to HTTP", "error", err)
-			a.reportStatusHTTP(st)
-		} else {
-			logger.Debug("status reported via hub",
-				"cpu", fmt.Sprintf("%.1f%%", st.CPUPercent),
-				"mem", fmt.Sprintf("%.1f%%", st.MemoryPercent),
-				"rules", st.ActiveRules)
-		}
-	} else {
-		a.reportStatusHTTP(st)
-	}
-}
-
-func (a *Agent) reportStatusHTTP(st *forward.AgentStatus) {
 	if err := a.client.ReportStatus(a.ctx, st); err != nil {
 		logger.Error("report status failed", "error", err)
 		return
 	}
 
-	logger.Debug("status reported via http",
+	logger.Debug("status reported",
 		"cpu", fmt.Sprintf("%.1f%%", st.CPUPercent),
 		"mem", fmt.Sprintf("%.1f%%", st.MemoryPercent),
 		"rules", st.ActiveRules)
@@ -387,14 +364,14 @@ func (a *Agent) stopAll() {
 	for _, f := range a.forwarders {
 		f.Stop()
 	}
-	a.forwarders = make(map[uint]forwarder.Forwarder)
+	a.forwarders = make(map[string]forwarder.Forwarder)
 	a.forwardersMu.Unlock()
 
 	a.tunnelsMu.Lock()
 	for _, t := range a.tunnels {
 		t.Stop()
 	}
-	a.tunnels = make(map[uint]*tunnel.Client)
+	a.tunnels = make(map[string]*tunnel.Client)
 	a.tunnelsMu.Unlock()
 
 	if a.tunnelServer != nil {
@@ -407,111 +384,29 @@ func (a *Agent) stopAll() {
 func (a *Agent) hubLoop() {
 	defer a.wg.Done()
 
-	reconnectInterval := 5 * time.Second
-
-	for {
-		select {
-		case <-a.ctx.Done():
-			return
-		default:
-		}
-
-		if err := a.runHub(); err != nil {
-			if a.ctx.Err() != nil {
-				return
-			}
-			logger.Error("hub connection error", "error", err)
-		}
-
-		select {
-		case <-a.ctx.Done():
-			return
-		case <-time.After(reconnectInterval):
-			logger.Info("reconnecting to hub...")
+	config := forward.DefaultReconnectConfig()
+	config.OnConnected = func() {
+		logger.Info("hub connected")
+	}
+	config.OnDisconnected = func(err error) {
+		if err != nil && a.ctx.Err() == nil {
+			logger.Warn("hub disconnected", "error", err)
 		}
 	}
-}
-
-// runHub establishes and runs the Hub connection.
-func (a *Agent) runHub() error {
-	conn, err := a.client.ForwardClient().ConnectHub(a.ctx)
-	if err != nil {
-		return fmt.Errorf("connect hub: %w", err)
+	config.OnReconnecting = func(attempt uint64, delay time.Duration) {
+		logger.Info("reconnecting to hub...", "attempt", attempt, "delay", delay)
 	}
 
-	a.hubMu.Lock()
-	a.hubConn = conn
-	a.hubMu.Unlock()
-
-	logger.Info("hub connected")
-
-	// Set up message handler for probe tasks
-	conn.SetMessageHandler(func(msg *forward.HubMessage) {
-		switch msg.Type {
-		case forward.MsgTypeProbeTask:
-			go a.handleProbeTask(msg)
-		case forward.MsgTypeCommand:
-			go a.handleCommand(msg)
-		}
-	})
-
-	// Run the connection (blocks until error or context done)
-	err = conn.Run(a.ctx)
-
-	a.hubMu.Lock()
-	a.hubConn = nil
-	a.hubMu.Unlock()
-
-	if err != nil && a.ctx.Err() == nil {
-		logger.Warn("hub disconnected", "error", err)
+	// ProbeTaskHandler processes probe tasks and returns results
+	probeHandler := func(task *forward.ProbeTask) *forward.ProbeTaskResult {
+		return a.executeProbe(task)
 	}
 
-	return err
-}
-
-// closeHub closes the current Hub connection.
-func (a *Agent) closeHub() {
-	a.hubMu.Lock()
-	defer a.hubMu.Unlock()
-
-	if a.hubConn != nil {
-		a.hubConn.Close()
-		a.hubConn = nil
-	}
-}
-
-// getHubConn returns the current Hub connection if available.
-func (a *Agent) getHubConn() *forward.HubConn {
-	a.hubMu.RLock()
-	defer a.hubMu.RUnlock()
-	return a.hubConn
-}
-
-// handleProbeTask handles probe task messages from the Hub.
-func (a *Agent) handleProbeTask(msg *forward.HubMessage) {
-	task := parseProbeTask(msg.Data)
-	if task == nil {
-		logger.Error("failed to parse probe task")
-		return
-	}
-
-	result := a.executeProbe(task)
-	if result == nil {
-		return
-	}
-
-	conn := a.getHubConn()
-	if conn != nil {
-		if err := conn.SendProbeResult(result); err != nil {
-			logger.Error("failed to send probe result", "error", err)
+	if err := a.client.ForwardClient().RunHubLoopWithReconnect(a.ctx, probeHandler, config); err != nil {
+		if a.ctx.Err() == nil {
+			logger.Error("hub loop error", "error", err)
 		}
 	}
-}
-
-// handleCommand handles command messages from the Hub.
-func (a *Agent) handleCommand(msg *forward.HubMessage) {
-	logger.Debug("received command", "data", msg.Data)
-	// TODO: Implement command handling (e.g., force sync, restart forwarder)
 }
 
 // executeProbe executes a probe task and returns the result.
@@ -564,7 +459,7 @@ func (a *Agent) probeTarget(target string, port uint16, protocol string, timeout
 }
 
 // probeTunnelByRule probes tunnel connectivity by rule ID.
-func (a *Agent) probeTunnelByRule(ruleID uint) (bool, string) {
+func (a *Agent) probeTunnelByRule(ruleID string) (bool, string) {
 	// Find the forwarder for this rule
 	a.forwardersMu.RLock()
 	f, exists := a.forwarders[ruleID]
@@ -586,27 +481,3 @@ func (a *Agent) probeTunnelByRule(ruleID uint) (bool, string) {
 	return true, ""
 }
 
-// parseProbeTask parses probe task from message data.
-func parseProbeTask(data any) *forward.ProbeTask {
-	if data == nil {
-		return nil
-	}
-
-	// Try direct type assertion first
-	if task, ok := data.(*forward.ProbeTask); ok {
-		return task
-	}
-
-	// Use JSON marshal/unmarshal for map conversion
-	dataBytes, err := json.Marshal(data)
-	if err != nil {
-		return nil
-	}
-
-	var task forward.ProbeTask
-	if err := json.Unmarshal(dataBytes, &task); err != nil {
-		return nil
-	}
-
-	return &task
-}

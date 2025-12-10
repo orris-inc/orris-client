@@ -80,6 +80,6 @@ func (c *Collector) SetActiveStats(status *forward.AgentStatus, activeRules, act
 }
 
 // SetTunnelStatus sets the tunnel connection states.
-func (c *Collector) SetTunnelStatus(status *forward.AgentStatus, tunnelStatus map[uint]forward.TunnelState) {
+func (c *Collector) SetTunnelStatus(status *forward.AgentStatus, tunnelStatus map[string]forward.TunnelState) {
 	status.TunnelStatus = tunnelStatus
 }

@@ -20,7 +20,7 @@ type Forwarder interface {
 	Start(ctx context.Context) error
 	Stop() error
 	Traffic() *TrafficCounter
-	RuleID() uint
+	RuleID() string
 }
 
 // TrafficCounter tracks upload and download bytes.
@@ -106,7 +106,7 @@ func (f *DirectForwarder) Traffic() *TrafficCounter {
 }
 
 // RuleID returns the rule ID.
-func (f *DirectForwarder) RuleID() uint {
+func (f *DirectForwarder) RuleID() string {
 	return f.rule.ID
 }
 
@@ -243,7 +243,7 @@ func (f *EntryForwarder) Traffic() *TrafficCounter {
 }
 
 // RuleID returns the rule ID.
-func (f *EntryForwarder) RuleID() uint {
+func (f *EntryForwarder) RuleID() string {
 	return f.rule.ID
 }
 
@@ -422,7 +422,7 @@ func (f *ExitForwarder) Traffic() *TrafficCounter {
 }
 
 // RuleID returns the rule ID.
-func (f *ExitForwarder) RuleID() uint {
+func (f *ExitForwarder) RuleID() string {
 	return f.rule.ID
 }
 
