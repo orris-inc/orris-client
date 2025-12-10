@@ -4,7 +4,7 @@ go 1.24.3
 
 require github.com/spf13/pflag v1.0.10
 
-require github.com/orris-inc/orris/sdk/forward v0.0.0-20251205063517-75ecb1458d35
+require github.com/orris-inc/orris/sdk/forward v0.0.0-20251210065340-b71691afce76
 
 require (
 	github.com/gorilla/websocket v1.5.3
@@ -12,6 +12,7 @@ require (
 )
 
 require (
+	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/ebitengine/purego v0.9.1 // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect

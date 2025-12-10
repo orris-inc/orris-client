@@ -33,7 +33,7 @@ func (c *Client) ReportTraffic(ctx context.Context, items []forward.TrafficItem)
 	return err
 }
 
-func (c *Client) GetExitEndpoint(ctx context.Context, exitAgentID uint) (*forward.ExitEndpoint, error) {
+func (c *Client) GetExitEndpoint(ctx context.Context, exitAgentID string) (*forward.ExitEndpoint, error) {
 	return c.fc.GetExitEndpoint(ctx, exitAgentID)
 }
 
