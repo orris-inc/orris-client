@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,11 @@ import (
 	"github.com/orris-inc/orris-client/internal/logger"
 	"github.com/orris-inc/orris-client/internal/tunnel"
 )
+
+// isClosedError checks if the error is due to closed connection.
+func isClosedError(err error) bool {
+	return errors.Is(err, net.ErrClosed)
+}
 
 // Forwarder is an interface for all forwarder types.
 type Forwarder interface {
@@ -134,7 +140,7 @@ func (f *DirectForwarder) handleConn(clientConn net.Conn) {
 	defer f.wg.Done()
 	defer clientConn.Close()
 
-	targetAddr := fmt.Sprintf("%s:%d", f.rule.TargetAddress, f.rule.TargetPort)
+	targetAddr := net.JoinHostPort(f.rule.TargetAddress, fmt.Sprintf("%d", f.rule.TargetPort))
 	targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 	if err != nil {
 		logger.Error("direct dial target failed", "target", targetAddr, "error", err)
@@ -332,7 +338,7 @@ func (f *EntryForwarder) handleConn(clientConn net.Conn) {
 
 		n, err := clientConn.Read(buf)
 		if err != nil {
-			if err != io.EOF {
+			if err != io.EOF && !isClosedError(err) {
 				logger.Debug("entry read from client failed", "conn_id", connID, "error", err)
 			}
 			return
@@ -428,7 +434,7 @@ func (f *ExitForwarder) RuleID() string {
 
 // HandleConnect handles connect message from tunnel.
 func (f *ExitForwarder) HandleConnect(connID uint64) {
-	targetAddr := fmt.Sprintf("%s:%d", f.rule.TargetAddress, f.rule.TargetPort)
+	targetAddr := net.JoinHostPort(f.rule.TargetAddress, fmt.Sprintf("%d", f.rule.TargetPort))
 	targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 	if err != nil {
 		logger.Error("exit dial target failed", "conn_id", connID, "target", targetAddr, "error", err)
@@ -486,7 +492,7 @@ func (f *ExitForwarder) readFromTarget(connID uint64, targetConn net.Conn) {
 
 		n, err := targetConn.Read(buf)
 		if err != nil {
-			if err != io.EOF {
+			if err != io.EOF && !isClosedError(err) {
 				logger.Debug("exit read from target failed", "conn_id", connID, "error", err)
 			}
 			return
