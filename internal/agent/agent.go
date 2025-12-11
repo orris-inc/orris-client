@@ -179,7 +179,18 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 		switch rule.Role {
 		case "entry":
 			// Entry role: establish tunnel to exit agent
-			t, err := a.getOrCreateTunnel(rule)
+			var t *tunnel.Client
+			var err error
+
+			// If NextHopAddress is already provided, use it directly
+			// Otherwise, query endpoint via GetExitEndpoint if NextHopAgentID is set
+			if rule.NextHopAddress != "" {
+				t, err = a.getOrCreateTunnelByAddress(rule)
+			} else if rule.NextHopAgentID != "" {
+				t, err = a.getOrCreateTunnel(rule)
+			} else {
+				return fmt.Errorf("entry rule missing next hop info")
+			}
 			if err != nil {
 				return fmt.Errorf("create tunnel: %w", err)
 			}
@@ -282,7 +293,16 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (*tunnel.Client, error) {
 		return t, nil
 	}
 
-	endpoint, err := a.client.GetExitEndpoint(a.ctx, rule.ExitAgentID)
+	// Use NextHopAgentID to get endpoint (ExitAgentID is deprecated in RuleSyncData)
+	agentID := rule.NextHopAgentID
+	if agentID == "" {
+		agentID = rule.ExitAgentID // fallback for legacy API response
+	}
+	if agentID == "" {
+		return nil, fmt.Errorf("no next hop agent ID specified")
+	}
+
+	endpoint, err := a.client.GetExitEndpoint(a.ctx, agentID)
 	if err != nil {
 		return nil, fmt.Errorf("get exit endpoint: %w", err)
 	}
@@ -291,7 +311,7 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (*tunnel.Client, error) {
 
 	// Create endpoint refresher to handle exit agent restarts with port changes
 	refresher := func() (string, string, error) {
-		ep, err := a.client.GetExitEndpoint(a.ctx, rule.ExitAgentID)
+		ep, err := a.client.GetExitEndpoint(a.ctx, agentID)
 		if err != nil {
 			return "", "", err
 		}
@@ -326,8 +346,15 @@ func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (*tunnel.Client, 
 	}
 
 	wsURL := fmt.Sprintf("ws://%s:%d/tunnel", rule.NextHopAddress, rule.NextHopWsPort)
-	// Use agent's own token for handshake authentication (same as entry rules)
-	t := tunnel.NewClient(wsURL, a.cfg.Token, rule.ID,
+
+	// Use NextHopConnectionToken if available (short-term token for chain authentication),
+	// otherwise fall back to agent's own token
+	token := rule.NextHopConnectionToken
+	if token == "" {
+		token = a.cfg.Token
+	}
+
+	t := tunnel.NewClient(wsURL, token, rule.ID,
 		tunnel.WithReconnectInterval(5*time.Second),
 		tunnel.WithHeartbeatInterval(30*time.Second),
 	)
@@ -899,7 +926,8 @@ func (a *Agent) probeTunnelByRule(ruleID string) (bool, string) {
 // ruleSyncDataToRule converts RuleSyncData to forward.Rule.
 func ruleSyncDataToRule(data *forward.RuleSyncData) *forward.Rule {
 	return &forward.Rule{
-		ID:             data.ShortID,
+		ID:             data.ID,
+		AgentID:        data.AgentID,
 		RuleType:       forward.RuleType(data.RuleType),
 		ListenPort:     data.ListenPort,
 		TargetAddress:  data.TargetAddress,
