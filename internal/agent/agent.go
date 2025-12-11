@@ -31,6 +31,9 @@ type Agent struct {
 	tunnelServer  *tunnel.Server
 	signingSecret string
 	rules         []forward.Rule
+	rulesMu       sync.RWMutex
+
+	configVersion uint64 // current config version from server
 
 	ctx      context.Context
 	cancelFn context.CancelFunc
@@ -79,10 +82,19 @@ func (a *Agent) Wait() {
 	a.wg.Wait()
 }
 
+// syncLoop is a fallback mechanism for rule synchronization.
+// Primary sync is done via WebSocket events from hub, but this loop ensures
+// rules are eventually consistent even if WebSocket connection is unstable.
 func (a *Agent) syncLoop() {
 	defer a.wg.Done()
 
-	ticker := time.NewTicker(a.cfg.SyncInterval)
+	// Use a longer interval since primary sync is via WebSocket events
+	fallbackInterval := a.cfg.SyncInterval * 10 // 5 minutes by default
+	if fallbackInterval < 5*time.Minute {
+		fallbackInterval = 5 * time.Minute
+	}
+
+	ticker := time.NewTicker(fallbackInterval)
 	defer ticker.Stop()
 
 	for {
@@ -91,7 +103,7 @@ func (a *Agent) syncLoop() {
 			return
 		case <-ticker.C:
 			if err := a.syncRules(); err != nil {
-				logger.Error("sync rules failed", "error", err)
+				logger.Error("fallback sync rules failed", "error", err)
 			}
 		}
 	}
@@ -108,8 +120,10 @@ func (a *Agent) syncRules() error {
 	logger.Info("rules synced successfully", "count", len(rules))
 
 	// Save signing secret and rules for handshake verification
+	a.rulesMu.Lock()
 	a.signingSecret = resp.TokenSigningSecret
 	a.rules = rules
+	a.rulesMu.Unlock()
 
 	// Update tunnel server rules if exists
 	if a.tunnelServer != nil {
@@ -518,28 +532,295 @@ func (a *Agent) stopAll() {
 func (a *Agent) hubLoop() {
 	defer a.wg.Done()
 
-	config := forward.DefaultReconnectConfig()
-	config.OnConnected = func() {
+	reconnectCfg := forward.DefaultReconnectConfig()
+	reconnectCfg.OnConnected = func() {
 		logger.Info("hub connected")
 	}
-	config.OnDisconnected = func(err error) {
+	reconnectCfg.OnDisconnected = func(err error) {
 		if err != nil && a.ctx.Err() == nil {
 			logger.Warn("hub disconnected", "error", err)
 		}
 	}
-	config.OnReconnecting = func(attempt uint64, delay time.Duration) {
+	reconnectCfg.OnReconnecting = func(attempt uint64, delay time.Duration) {
 		logger.Info("reconnecting to hub...", "attempt", attempt, "delay", delay)
 	}
 
-	// ProbeTaskHandler processes probe tasks and returns results
-	probeHandler := func(task *forward.ProbeTask) *forward.ProbeTaskResult {
-		return a.executeProbe(task)
+	a.runHubWithReconnect(reconnectCfg)
+}
+
+// runHubWithReconnect runs the hub connection loop with reconnection logic.
+func (a *Agent) runHubWithReconnect(reconnectCfg *forward.ReconnectConfig) {
+	backoff := time.Second
+	maxBackoff := reconnectCfg.MaxInterval
+	if maxBackoff == 0 {
+		maxBackoff = 60 * time.Second
 	}
 
-	if err := a.client.ForwardClient().RunHubLoopWithReconnect(a.ctx, probeHandler, config); err != nil {
-		if a.ctx.Err() == nil {
-			logger.Error("hub loop error", "error", err)
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		default:
 		}
+
+		err := a.runHubOnce(reconnectCfg)
+		if a.ctx.Err() != nil {
+			return
+		}
+
+		if reconnectCfg.OnDisconnected != nil {
+			reconnectCfg.OnDisconnected(err)
+		}
+
+		// Exponential backoff
+		logger.Info("reconnecting to hub...", "delay", backoff)
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+
+		backoff = time.Duration(float64(backoff) * reconnectCfg.Multiplier)
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+// runHubOnce runs a single hub connection lifecycle.
+func (a *Agent) runHubOnce(reconnectCfg *forward.ReconnectConfig) error {
+	conn, err := a.client.ForwardClient().ConnectHub(a.ctx)
+	if err != nil {
+		return fmt.Errorf("connect hub: %w", err)
+	}
+	defer conn.Close()
+
+	if reconnectCfg.OnConnected != nil {
+		reconnectCfg.OnConnected()
+	}
+
+	// Start connection read/write pumps in background
+	connErrCh := make(chan error, 1)
+	go func() {
+		connErrCh <- conn.Run(a.ctx)
+	}()
+
+	// Process events from hub
+	for {
+		select {
+		case <-a.ctx.Done():
+			return a.ctx.Err()
+
+		case err := <-connErrCh:
+			return err
+
+		case event, ok := <-conn.Events:
+			if !ok {
+				return fmt.Errorf("events channel closed")
+			}
+			a.handleHubEvent(conn, event)
+		}
+	}
+}
+
+// handleHubEvent processes events from hub connection.
+func (a *Agent) handleHubEvent(conn *forward.HubConn, event *forward.HubEvent) {
+	switch event.Type {
+	case forward.HubEventConfigSync:
+		if event.ConfigSync != nil {
+			a.handleConfigSync(conn, event.ConfigSync)
+		}
+
+	case forward.HubEventProbeTask:
+		if event.ProbeTask != nil {
+			go func() {
+				result := a.executeProbe(event.ProbeTask)
+				if result != nil {
+					conn.SendProbeResult(result)
+				}
+			}()
+		}
+	}
+}
+
+// handleConfigSync processes configuration sync events from hub.
+func (a *Agent) handleConfigSync(conn *forward.HubConn, data *forward.ConfigSyncData) {
+	logger.Info("received config sync",
+		"version", data.Version,
+		"full_sync", data.FullSync,
+		"added", len(data.Added),
+		"updated", len(data.Updated),
+		"removed", len(data.Removed))
+
+	// Skip if we already have this version or newer
+	if data.Version <= a.configVersion && !data.FullSync {
+		logger.Debug("skipping config sync, already at version", "current", a.configVersion, "received", data.Version)
+		conn.SendConfigAck(&forward.ConfigAckData{
+			Version: data.Version,
+			Success: true,
+		})
+		return
+	}
+
+	var syncErr error
+
+	// Handle full sync - stop all and restart
+	if data.FullSync {
+		syncErr = a.handleFullSync(data)
+	} else {
+		syncErr = a.handleIncrementalSync(data)
+	}
+
+	// Send acknowledgment
+	ack := &forward.ConfigAckData{
+		Version: data.Version,
+		Success: syncErr == nil,
+	}
+	if syncErr != nil {
+		ack.Error = syncErr.Error()
+		logger.Error("config sync failed", "error", syncErr)
+	} else {
+		a.configVersion = data.Version
+		logger.Info("config sync completed", "version", data.Version)
+	}
+
+	conn.SendConfigAck(ack)
+}
+
+// handleFullSync handles full configuration sync.
+func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
+	// Build rule map from added rules
+	newRules := make(map[string]*forward.Rule)
+	for i := range data.Added {
+		rule := ruleSyncDataToRule(&data.Added[i])
+		newRules[rule.ID] = rule
+	}
+
+	// Stop forwarders not in new rules
+	a.forwardersMu.Lock()
+	for ruleID, f := range a.forwarders {
+		if _, exists := newRules[ruleID]; !exists {
+			logger.Info("stopping forwarder for removed rule", "rule_id", ruleID)
+			f.Stop()
+			delete(a.forwarders, ruleID)
+		}
+	}
+	a.forwardersMu.Unlock()
+
+	// Update rules list for tunnel server
+	a.rulesMu.Lock()
+	a.rules = make([]forward.Rule, 0, len(newRules))
+	for _, rule := range newRules {
+		a.rules = append(a.rules, *rule)
+	}
+	a.rulesMu.Unlock()
+
+	if a.tunnelServer != nil {
+		a.rulesMu.RLock()
+		a.tunnelServer.UpdateRules(a.rules)
+		a.rulesMu.RUnlock()
+	}
+
+	// Start forwarders for new rules
+	for _, rule := range newRules {
+		a.forwardersMu.RLock()
+		_, exists := a.forwarders[rule.ID]
+		a.forwardersMu.RUnlock()
+
+		if !exists {
+			if err := a.startForwarder(rule); err != nil {
+				logger.Error("start forwarder failed", "rule_id", rule.ID, "error", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// handleIncrementalSync handles incremental configuration sync.
+func (a *Agent) handleIncrementalSync(data *forward.ConfigSyncData) error {
+	// Handle removed rules
+	for _, ruleID := range data.Removed {
+		a.stopForwarder(ruleID)
+	}
+
+	// Handle updated rules (stop then start)
+	for i := range data.Updated {
+		rule := ruleSyncDataToRule(&data.Updated[i])
+		a.stopForwarder(rule.ID)
+		if err := a.startForwarder(rule); err != nil {
+			logger.Error("restart forwarder failed", "rule_id", rule.ID, "error", err)
+		}
+	}
+
+	// Handle added rules
+	for i := range data.Added {
+		rule := ruleSyncDataToRule(&data.Added[i])
+		if err := a.startForwarder(rule); err != nil {
+			logger.Error("start forwarder failed", "rule_id", rule.ID, "error", err)
+		}
+	}
+
+	// Update rules list
+	a.updateRulesList(data)
+
+	return nil
+}
+
+// stopForwarder stops and removes a forwarder by rule ID.
+func (a *Agent) stopForwarder(ruleID string) {
+	a.forwardersMu.Lock()
+	if f, exists := a.forwarders[ruleID]; exists {
+		logger.Info("stopping forwarder", "rule_id", ruleID)
+		f.Stop()
+		delete(a.forwarders, ruleID)
+	}
+	a.forwardersMu.Unlock()
+
+	// Also stop tunnel if exists
+	a.tunnelsMu.Lock()
+	if t, exists := a.tunnels[ruleID]; exists {
+		t.Stop()
+		delete(a.tunnels, ruleID)
+	}
+	a.tunnelsMu.Unlock()
+}
+
+// updateRulesList updates the internal rules list based on sync data.
+func (a *Agent) updateRulesList(data *forward.ConfigSyncData) {
+	a.rulesMu.Lock()
+	defer a.rulesMu.Unlock()
+
+	// Build map from current rules
+	ruleMap := make(map[string]*forward.Rule)
+	for i := range a.rules {
+		ruleMap[a.rules[i].ID] = &a.rules[i]
+	}
+
+	// Remove
+	for _, ruleID := range data.Removed {
+		delete(ruleMap, ruleID)
+	}
+
+	// Add/Update
+	for i := range data.Added {
+		rule := ruleSyncDataToRule(&data.Added[i])
+		ruleMap[rule.ID] = rule
+	}
+	for i := range data.Updated {
+		rule := ruleSyncDataToRule(&data.Updated[i])
+		ruleMap[rule.ID] = rule
+	}
+
+	// Rebuild rules slice
+	a.rules = make([]forward.Rule, 0, len(ruleMap))
+	for _, rule := range ruleMap {
+		a.rules = append(a.rules, *rule)
+	}
+
+	// Update tunnel server
+	if a.tunnelServer != nil {
+		a.tunnelServer.UpdateRules(a.rules)
 	}
 }
 
@@ -613,4 +894,23 @@ func (a *Agent) probeTunnelByRule(ruleID string) (bool, string) {
 
 	// For non-entry rules, just check if forwarder exists
 	return true, ""
+}
+
+// ruleSyncDataToRule converts RuleSyncData to forward.Rule.
+func ruleSyncDataToRule(data *forward.RuleSyncData) *forward.Rule {
+	return &forward.Rule{
+		ID:             data.ShortID,
+		RuleType:       forward.RuleType(data.RuleType),
+		ListenPort:     data.ListenPort,
+		TargetAddress:  data.TargetAddress,
+		TargetPort:     data.TargetPort,
+		Protocol:       data.Protocol,
+		Role:           data.Role,
+		NextHopAgentID: data.NextHopAgentID,
+		NextHopAddress: data.NextHopAddress,
+		NextHopWsPort:  data.NextHopWsPort,
+		ChainAgentIDs:  data.ChainAgentIDs,
+		ChainPosition:  data.ChainPosition,
+		IsLastInChain:  data.IsLastInChain,
+	}
 }
