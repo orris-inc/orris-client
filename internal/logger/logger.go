@@ -10,10 +10,19 @@ import (
 	"time"
 )
 
-var defaultLogger *slog.Logger
+var (
+	defaultLogger *slog.Logger
+	defaultLevel  = new(slog.LevelVar)
+)
 
 func init() {
-	defaultLogger = slog.New(NewHandler(os.Stdout))
+	defaultLevel.Set(slog.LevelInfo)
+	defaultLogger = slog.New(NewHandler(os.Stdout, defaultLevel))
+}
+
+// SetLevel sets the minimum log level.
+func SetLevel(level slog.Level) {
+	defaultLevel.Set(level)
 }
 
 func Default() *slog.Logger {
@@ -39,19 +48,21 @@ func Debug(msg string, args ...any) {
 type Handler struct {
 	out   io.Writer
 	mu    *sync.Mutex
+	level *slog.LevelVar
 	attrs []slog.Attr
 	group string
 }
 
-func NewHandler(out io.Writer) *Handler {
+func NewHandler(out io.Writer, level *slog.LevelVar) *Handler {
 	return &Handler{
-		out: out,
-		mu:  &sync.Mutex{},
+		out:   out,
+		mu:    &sync.Mutex{},
+		level: level,
 	}
 }
 
-func (h *Handler) Enabled(_ context.Context, _ slog.Level) bool {
-	return true
+func (h *Handler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= h.level.Level()
 }
 
 func (h *Handler) Handle(_ context.Context, r slog.Record) error {
@@ -84,6 +95,7 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &Handler{
 		out:   h.out,
 		mu:    h.mu,
+		level: h.level,
 		attrs: newAttrs,
 		group: h.group,
 	}
@@ -98,6 +110,7 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 	return &Handler{
 		out:   h.out,
 		mu:    h.mu,
+		level: h.level,
 		attrs: h.attrs,
 		group: newGroup,
 	}
