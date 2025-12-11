@@ -3,14 +3,15 @@ package tunnel
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/orris-inc/orris/sdk/forward"
 
 	"github.com/easayliu/orris-client/internal/logger"
 )
@@ -30,7 +31,9 @@ type Sender interface {
 // Server is a WebSocket tunnel server for Exit agents.
 // It accepts connections from Entry agents and forwards data to targets.
 type Server struct {
-	port uint16
+	port          uint16
+	signingSecret string
+	rules         []forward.Rule
 
 	listener net.Listener
 	server   *http.Server
@@ -39,9 +42,10 @@ type Server struct {
 	handlerMu sync.RWMutex
 	handlers  map[string]MessageHandler // ruleID -> handler
 
-	connMu   sync.RWMutex
-	conns    map[*websocket.Conn]struct{}
-	connLock map[*websocket.Conn]*sync.Mutex // per-connection write lock
+	connMu      sync.RWMutex
+	conns       map[*websocket.Conn]struct{}
+	connLock    map[*websocket.Conn]*sync.Mutex    // per-connection write lock
+	connHandler map[*websocket.Conn]MessageHandler // per-connection handler (by ruleID)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -49,18 +53,28 @@ type Server struct {
 }
 
 // NewServer creates a new tunnel server.
-func NewServer(port uint16) *Server {
+func NewServer(port uint16, signingSecret string, rules []forward.Rule) *Server {
 	return &Server{
-		port:     port,
-		handlers: make(map[string]MessageHandler),
-		conns:    make(map[*websocket.Conn]struct{}),
-		connLock: make(map[*websocket.Conn]*sync.Mutex),
+		port:          port,
+		signingSecret: signingSecret,
+		rules:         rules,
+		handlers:      make(map[string]MessageHandler),
+		conns:         make(map[*websocket.Conn]struct{}),
+		connLock:      make(map[*websocket.Conn]*sync.Mutex),
+		connHandler:   make(map[*websocket.Conn]MessageHandler),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true
 			},
 		},
 	}
+}
+
+// UpdateRules updates the rules for handshake verification.
+func (s *Server) UpdateRules(rules []forward.Rule) {
+	s.connMu.Lock()
+	s.rules = rules
+	s.connMu.Unlock()
 }
 
 // AddHandler adds a message handler for a rule.
@@ -131,6 +145,7 @@ func (s *Server) Stop() error {
 	}
 	s.conns = make(map[*websocket.Conn]struct{})
 	s.connLock = make(map[*websocket.Conn]*sync.Mutex)
+	s.connHandler = make(map[*websocket.Conn]MessageHandler)
 	s.connMu.Unlock()
 
 	if s.server != nil {
@@ -145,11 +160,6 @@ func (s *Server) Stop() error {
 }
 
 func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
-	if !s.validateToken(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logger.Error("tunnel upgrade failed", "error", err)
@@ -158,47 +168,106 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 	// Create per-connection write lock
 	writeMu := &sync.Mutex{}
+	sender := &connSender{conn: conn, mu: writeMu}
+
+	// Perform handshake
+	ruleID, err := s.performHandshake(conn, sender)
+	if err != nil {
+		logger.Error("tunnel handshake failed", "remote", r.RemoteAddr, "error", err)
+		conn.Close()
+		return
+	}
+
+	// Get handler for this rule
+	s.handlerMu.RLock()
+	handler, ok := s.handlers[ruleID]
+	s.handlerMu.RUnlock()
+
+	if !ok {
+		logger.Error("no handler for rule", "rule_id", ruleID)
+		conn.Close()
+		return
+	}
+
+	// Set sender for the handler
+	if sh, ok := handler.(interface{ SetSender(Sender) }); ok {
+		sh.SetSender(sender)
+	}
 
 	s.connMu.Lock()
 	s.conns[conn] = struct{}{}
 	s.connLock[conn] = writeMu
+	s.connHandler[conn] = handler
 	s.connMu.Unlock()
 
-	logger.Info("entry agent connected", "remote", r.RemoteAddr)
-
-	sender := &connSender{conn: conn, mu: writeMu}
-
-	s.handlerMu.RLock()
-	for _, h := range s.handlers {
-		if sh, ok := h.(interface{ SetSender(Sender) }); ok {
-			sh.SetSender(sender)
-		}
-	}
-	s.handlerMu.RUnlock()
+	logger.Info("entry agent connected", "remote", r.RemoteAddr, "rule_id", ruleID)
 
 	defer func() {
 		s.connMu.Lock()
 		delete(s.conns, conn)
 		delete(s.connLock, conn)
+		delete(s.connHandler, conn)
 		s.connMu.Unlock()
 		conn.Close()
-		logger.Info("entry agent disconnected", "remote", r.RemoteAddr)
+		logger.Info("entry agent disconnected", "remote", r.RemoteAddr, "rule_id", ruleID)
 	}()
 
-	s.readLoop(conn, sender)
+	s.readLoop(conn, sender, handler)
 }
 
-func (s *Server) validateToken(r *http.Request) bool {
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
-		return false
+func (s *Server) performHandshake(conn *websocket.Conn, sender *connSender) (string, error) {
+	// Set read deadline for handshake
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+
+	// Read handshake message
+	_, data, err := conn.ReadMessage()
+	if err != nil {
+		return "", fmt.Errorf("read handshake: %w", err)
 	}
-	token := strings.TrimPrefix(auth, "Bearer ")
-	// Trust non-empty token (only legitimate Entry agents can obtain token from API)
-	return token != ""
+
+	var handshake forward.TunnelHandshake
+	if err := json.Unmarshal(data, &handshake); err != nil {
+		return "", fmt.Errorf("unmarshal handshake: %w", err)
+	}
+
+	// Verify handshake
+	s.connMu.RLock()
+	rules := s.rules
+	signingSecret := s.signingSecret
+	s.connMu.RUnlock()
+
+	result, err := forward.VerifyTunnelHandshake(&handshake, signingSecret, rules)
+	if err != nil {
+		// Send failure result
+		failResult := &forward.TunnelHandshakeResult{
+			Success: false,
+			Error:   err.Error(),
+		}
+		resultData, _ := json.Marshal(failResult)
+		sender.mu.Lock()
+		conn.WriteMessage(websocket.TextMessage, resultData)
+		sender.mu.Unlock()
+		return "", fmt.Errorf("verify handshake: %w", err)
+	}
+
+	// Send success result
+	resultData, err := json.Marshal(result)
+	if err != nil {
+		return "", fmt.Errorf("marshal result: %w", err)
+	}
+	sender.mu.Lock()
+	err = conn.WriteMessage(websocket.TextMessage, resultData)
+	sender.mu.Unlock()
+	if err != nil {
+		return "", fmt.Errorf("send result: %w", err)
+	}
+
+	logger.Info("tunnel handshake verified", "rule_id", handshake.RuleID, "entry_agent_id", result.EntryAgentID)
+	return handshake.RuleID, nil
 }
 
-func (s *Server) readLoop(conn *websocket.Conn, sender *connSender) {
+func (s *Server) readLoop(conn *websocket.Conn, sender *connSender, handler MessageHandler) {
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -220,24 +289,11 @@ func (s *Server) readLoop(conn *websocket.Conn, sender *connSender) {
 			continue
 		}
 
-		s.handleMessage(sender, msg)
+		s.handleMessage(sender, handler, msg)
 	}
 }
 
-func (s *Server) handleMessage(sender *connSender, msg *Message) {
-	s.handlerMu.RLock()
-	var handler MessageHandler
-	for _, h := range s.handlers {
-		handler = h
-		break
-	}
-	s.handlerMu.RUnlock()
-
-	if handler == nil {
-		logger.Warn("no handler available")
-		return
-	}
-
+func (s *Server) handleMessage(sender *connSender, handler MessageHandler, msg *Message) {
 	switch msg.Type {
 	case MsgConnect:
 		handler.HandleConnect(msg.ConnID)

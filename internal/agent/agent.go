@@ -26,9 +26,11 @@ type Agent struct {
 	forwarders   map[string]forwarder.Forwarder
 
 	tunnelsMu sync.RWMutex
-	tunnels   map[string]*tunnel.Client // exitAgentID -> tunnel
+	tunnels   map[string]*tunnel.Client // ruleID -> tunnel
 
-	tunnelServer *tunnel.Server
+	tunnelServer  *tunnel.Server
+	signingSecret string
+	rules         []forward.Rule
 
 	ctx      context.Context
 	cancelFn context.CancelFunc
@@ -97,12 +99,22 @@ func (a *Agent) syncLoop() {
 
 func (a *Agent) syncRules() error {
 	logger.Info("requesting enabled rules")
-	rules, err := a.client.GetRules(a.ctx)
+	resp, err := a.client.GetRules(a.ctx)
 	if err != nil {
 		return err
 	}
 
+	rules := resp.Rules
 	logger.Info("rules synced successfully", "count", len(rules))
+
+	// Save signing secret and rules for handshake verification
+	a.signingSecret = resp.TokenSigningSecret
+	a.rules = rules
+
+	// Update tunnel server rules if exists
+	if a.tunnelServer != nil {
+		a.tunnelServer.UpdateRules(rules)
+	}
 
 	ruleMap := make(map[string]*forward.Rule)
 	for i := range rules {
@@ -153,7 +165,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 		switch rule.Role {
 		case "entry":
 			// Entry role: establish tunnel to exit agent
-			t, err := a.getOrCreateTunnel(rule.ExitAgentID)
+			t, err := a.getOrCreateTunnel(rule)
 			if err != nil {
 				return fmt.Errorf("create tunnel: %w", err)
 			}
@@ -187,7 +199,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 		switch rule.Role {
 		case "entry":
 			// Chain entry: connect to next hop
-			t, err := a.getOrCreateTunnelByAddress(rule.NextHopAddress, rule.NextHopWsPort, rule.NextHopConnectionToken)
+			t, err := a.getOrCreateTunnelByAddress(rule)
 			if err != nil {
 				return fmt.Errorf("create tunnel to next hop: %w", err)
 			}
@@ -206,7 +218,7 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			}
 
 			// Connect to next hop
-			t, err := a.getOrCreateTunnelByAddress(rule.NextHopAddress, rule.NextHopWsPort, rule.NextHopConnectionToken)
+			t, err := a.getOrCreateTunnelByAddress(rule)
 			if err != nil {
 				return fmt.Errorf("create tunnel to next hop: %w", err)
 			}
@@ -247,48 +259,61 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 	return nil
 }
 
-func (a *Agent) getOrCreateTunnel(exitAgentID string) (*tunnel.Client, error) {
+func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (*tunnel.Client, error) {
 	a.tunnelsMu.Lock()
 	defer a.tunnelsMu.Unlock()
 
-	if t, exists := a.tunnels[exitAgentID]; exists {
+	// Use ruleID as key since each rule needs its own tunnel connection for handshake
+	if t, exists := a.tunnels[rule.ID]; exists {
 		return t, nil
 	}
 
-	endpoint, err := a.client.GetExitEndpoint(a.ctx, exitAgentID)
+	endpoint, err := a.client.GetExitEndpoint(a.ctx, rule.ExitAgentID)
 	if err != nil {
 		return nil, fmt.Errorf("get exit endpoint: %w", err)
 	}
 
 	wsURL := fmt.Sprintf("ws://%s:%d/tunnel", endpoint.Address, endpoint.WsPort)
-	// Use ConnectionToken from API for agent-to-agent authentication
-	t := tunnel.NewClient(wsURL, endpoint.ConnectionToken,
+
+	// Create endpoint refresher to handle exit agent restarts with port changes
+	refresher := func() (string, string, error) {
+		ep, err := a.client.GetExitEndpoint(a.ctx, rule.ExitAgentID)
+		if err != nil {
+			return "", "", err
+		}
+		newURL := fmt.Sprintf("ws://%s:%d/tunnel", ep.Address, ep.WsPort)
+		return newURL, a.cfg.Token, nil
+	}
+
+	// Use agent's own token for handshake authentication
+	t := tunnel.NewClient(wsURL, a.cfg.Token, rule.ID,
 		tunnel.WithReconnectInterval(5*time.Second),
 		tunnel.WithHeartbeatInterval(30*time.Second),
+		tunnel.WithEndpointRefresher(refresher, 3), // refresh after 3 failed attempts
 	)
 
 	if err := t.Start(a.ctx); err != nil {
 		return nil, fmt.Errorf("start tunnel: %w", err)
 	}
 
-	a.tunnels[exitAgentID] = t
+	a.tunnels[rule.ID] = t
 	return t, nil
 }
 
 // getOrCreateTunnelByAddress creates a tunnel connection to a specific address.
-// connectionToken is the JWT token for agent-to-agent authentication.
-func (a *Agent) getOrCreateTunnelByAddress(address string, wsPort uint16, connectionToken string) (*tunnel.Client, error) {
-	key := fmt.Sprintf("%s:%d", address, wsPort)
-
+// Used for chain rules where the next hop address is explicitly provided.
+func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (*tunnel.Client, error) {
 	a.tunnelsMu.Lock()
 	defer a.tunnelsMu.Unlock()
 
-	if t, exists := a.tunnels[key]; exists {
+	// Use ruleID as key since each rule needs its own tunnel connection for handshake
+	if t, exists := a.tunnels[rule.ID]; exists {
 		return t, nil
 	}
 
-	wsURL := fmt.Sprintf("ws://%s:%d/tunnel", address, wsPort)
-	t := tunnel.NewClient(wsURL, connectionToken,
+	wsURL := fmt.Sprintf("ws://%s:%d/tunnel", rule.NextHopAddress, rule.NextHopWsPort)
+	// Use agent's own token for handshake authentication (same as entry rules)
+	t := tunnel.NewClient(wsURL, a.cfg.Token, rule.ID,
 		tunnel.WithReconnectInterval(5*time.Second),
 		tunnel.WithHeartbeatInterval(30*time.Second),
 	)
@@ -297,7 +322,7 @@ func (a *Agent) getOrCreateTunnelByAddress(address string, wsPort uint16, connec
 		return nil, fmt.Errorf("start tunnel: %w", err)
 	}
 
-	a.tunnels[key] = t
+	a.tunnels[rule.ID] = t
 	return t, nil
 }
 
@@ -308,7 +333,7 @@ func (a *Agent) ensureTunnelServer() error {
 		return nil
 	}
 
-	a.tunnelServer = tunnel.NewServer(a.cfg.WsListenPort)
+	a.tunnelServer = tunnel.NewServer(a.cfg.WsListenPort, a.signingSecret, a.rules)
 	if err := a.tunnelServer.Start(a.ctx); err != nil {
 		return fmt.Errorf("start tunnel server: %w", err)
 	}

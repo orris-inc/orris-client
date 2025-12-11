@@ -21,7 +21,7 @@ func (c *Client) ForwardClient() *forward.Client {
 	return c.fc
 }
 
-func (c *Client) GetRules(ctx context.Context) ([]forward.Rule, error) {
+func (c *Client) GetRules(ctx context.Context) (*forward.RulesResponse, error) {
 	return c.fc.GetRules(ctx)
 }
 

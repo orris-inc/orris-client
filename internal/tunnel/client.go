@@ -3,11 +3,13 @@ package tunnel
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/orris-inc/orris/sdk/forward"
 
 	"github.com/easayliu/orris-client/internal/logger"
 )
@@ -18,18 +20,26 @@ type DataHandler interface {
 	HandleClose(connID uint64)
 }
 
+// EndpointRefresher refreshes the tunnel endpoint when reconnection fails.
+// It returns the new endpoint URL and token, or an error if refresh fails.
+type EndpointRefresher func() (endpoint, token string, err error)
+
 // Client is a WebSocket tunnel client for Entry agents.
 // It connects to an Exit agent and forwards data through the tunnel.
 type Client struct {
-	endpoint string
-	token    string
-	conn     *websocket.Conn
+	endpointMu sync.RWMutex
+	endpoint   string
+	token      string
+	ruleID     string
+	conn       *websocket.Conn
 
 	writeMu sync.Mutex
 	handler DataHandler
 
-	reconnectInterval time.Duration
-	heartbeatInterval time.Duration
+	reconnectInterval    time.Duration
+	heartbeatInterval    time.Duration
+	refreshAfterAttempts int // refresh endpoint after this many failed reconnect attempts
+	endpointRefresher    EndpointRefresher
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -53,11 +63,22 @@ func WithHeartbeatInterval(d time.Duration) ClientOption {
 	}
 }
 
+// WithEndpointRefresher sets the endpoint refresher callback.
+// When reconnection fails after refreshAfterAttempts, the refresher is called
+// to get a new endpoint (e.g., when the exit agent restarts with a new port).
+func WithEndpointRefresher(refresher EndpointRefresher, refreshAfterAttempts int) ClientOption {
+	return func(c *Client) {
+		c.endpointRefresher = refresher
+		c.refreshAfterAttempts = refreshAfterAttempts
+	}
+}
+
 // NewClient creates a new tunnel client.
-func NewClient(endpoint, token string, opts ...ClientOption) *Client {
+func NewClient(endpoint, token, ruleID string, opts ...ClientOption) *Client {
 	c := &Client{
 		endpoint:          endpoint,
 		token:             token,
+		ruleID:            ruleID,
 		reconnectInterval: 5 * time.Second,
 		heartbeatInterval: 30 * time.Second,
 	}
@@ -133,19 +154,61 @@ func (c *Client) SendMessage(msg *Message) error {
 }
 
 func (c *Client) connect() error {
-	logger.Info("connecting to exit agent", "endpoint", c.endpoint)
+	c.endpointMu.RLock()
+	endpoint := c.endpoint
+	token := c.token
+	ruleID := c.ruleID
+	c.endpointMu.RUnlock()
+
+	logger.Info("connecting to exit agent", "endpoint", endpoint, "rule_id", ruleID)
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 	}
 
 	header := make(map[string][]string)
-	header["Authorization"] = []string{"Bearer " + c.token}
+	header["Authorization"] = []string{"Bearer " + token}
 
-	conn, _, err := dialer.DialContext(c.ctx, c.endpoint, header)
+	conn, _, err := dialer.DialContext(c.ctx, endpoint, header)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
+
+	// Send tunnel handshake
+	handshake := &forward.TunnelHandshake{
+		AgentToken: token,
+		RuleID:     ruleID,
+	}
+	handshakeData, err := json.Marshal(handshake)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("marshal handshake: %w", err)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, handshakeData); err != nil {
+		conn.Close()
+		return fmt.Errorf("send handshake: %w", err)
+	}
+
+	// Wait for handshake result
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, resultData, err := conn.ReadMessage()
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("read handshake result: %w", err)
+	}
+	conn.SetReadDeadline(time.Time{}) // Clear deadline
+
+	var result forward.TunnelHandshakeResult
+	if err := json.Unmarshal(resultData, &result); err != nil {
+		conn.Close()
+		return fmt.Errorf("unmarshal handshake result: %w", err)
+	}
+	if !result.Success {
+		conn.Close()
+		return fmt.Errorf("handshake failed: %s", result.Error)
+	}
+
+	logger.Info("tunnel handshake successful", "entry_agent_id", result.EntryAgentID)
 
 	// Hold write lock when updating connection
 	c.writeMu.Lock()
@@ -163,6 +226,7 @@ func (c *Client) connect() error {
 }
 
 func (c *Client) reconnect() bool {
+	failedAttempts := 0
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -170,7 +234,26 @@ func (c *Client) reconnect() bool {
 		case <-time.After(c.reconnectInterval):
 		}
 
-		logger.Info("attempting to reconnect...")
+		failedAttempts++
+		logger.Info("attempting to reconnect...", "attempt", failedAttempts)
+
+		// Try to refresh endpoint after configured number of failed attempts
+		if c.endpointRefresher != nil && c.refreshAfterAttempts > 0 &&
+			failedAttempts%c.refreshAfterAttempts == 0 {
+			logger.Info("refreshing endpoint after failed reconnect attempts", "attempts", failedAttempts)
+			if newEndpoint, newToken, err := c.endpointRefresher(); err != nil {
+				logger.Error("endpoint refresh failed", "error", err)
+			} else {
+				c.endpointMu.Lock()
+				if newEndpoint != c.endpoint {
+					logger.Info("endpoint updated", "old", c.endpoint, "new", newEndpoint)
+					c.endpoint = newEndpoint
+					c.token = newToken
+				}
+				c.endpointMu.Unlock()
+			}
+		}
+
 		if err := c.connect(); err != nil {
 			logger.Error("reconnect failed", "error", err)
 			continue
