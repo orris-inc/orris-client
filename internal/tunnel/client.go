@@ -33,8 +33,10 @@ type Client struct {
 	ruleID     string
 	conn       *websocket.Conn
 
-	writeMu sync.Mutex
-	handler DataHandler
+	writeMu      sync.Mutex
+	handler      DataHandler
+	cipher       Cipher // session cipher (created after key exchange)
+	sharedSecret string // shared secret for key derivation
 
 	backoff              *Backoff
 	heartbeatInterval    time.Duration
@@ -70,6 +72,14 @@ func WithEndpointRefresher(refresher EndpointRefresher, refreshAfterAttempts int
 	return func(c *Client) {
 		c.endpointRefresher = refresher
 		c.refreshAfterAttempts = refreshAfterAttempts
+	}
+}
+
+// WithSharedSecret sets the shared secret for session key derivation.
+// This enables forward-secure encryption with per-connection session keys.
+func WithSharedSecret(secret string) ClientOption {
+	return func(c *Client) {
+		c.sharedSecret = secret
 	}
 }
 
@@ -137,6 +147,14 @@ func (c *Client) SendMessage(msg *Message) error {
 	data, err := msg.Encode()
 	if err != nil {
 		return fmt.Errorf("encode message: %w", err)
+	}
+
+	// Encrypt if cipher is configured
+	if c.cipher != nil {
+		data, err = c.cipher.Encrypt(data)
+		if err != nil {
+			return fmt.Errorf("encrypt message: %w", err)
+		}
 	}
 
 	c.writeMu.Lock()
@@ -210,10 +228,23 @@ func (c *Client) connect() error {
 
 	logger.Info("tunnel handshake successful", "entry_agent_id", result.EntryAgentID)
 
-	// Hold write lock when updating connection
+	// Perform key exchange if shared secret is configured
+	var cipher Cipher
+	if c.sharedSecret != "" {
+		var err error
+		cipher, err = c.performKeyExchange(conn)
+		if err != nil {
+			conn.Close()
+			return fmt.Errorf("key exchange: %w", err)
+		}
+		logger.Info("session key established with forward secrecy")
+	}
+
+	// Hold write lock when updating connection and cipher
 	c.writeMu.Lock()
 	oldConn := c.conn
 	c.conn = conn
+	c.cipher = cipher
 	c.writeMu.Unlock()
 
 	// Close old connection if exists (during reconnect)
@@ -223,6 +254,58 @@ func (c *Client) connect() error {
 
 	logger.Info("connected to exit agent")
 	return nil
+}
+
+// performKeyExchange performs key exchange with server to establish session key.
+func (c *Client) performKeyExchange(conn *websocket.Conn) (Cipher, error) {
+	// Generate client nonce
+	clientNonce, err := GenerateNonce()
+	if err != nil {
+		return nil, fmt.Errorf("generate nonce: %w", err)
+	}
+
+	// Send client nonce
+	keyExMsg := NewKeyExchangeMessage(clientNonce)
+	keyExData, err := keyExMsg.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("encode key exchange: %w", err)
+	}
+	if err := conn.WriteMessage(websocket.BinaryMessage, keyExData); err != nil {
+		return nil, fmt.Errorf("send key exchange: %w", err)
+	}
+
+	// Receive server nonce
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, serverData, err := conn.ReadMessage()
+	if err != nil {
+		return nil, fmt.Errorf("read server key exchange: %w", err)
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	serverMsg, err := DecodeMessage(bytes.NewReader(serverData))
+	if err != nil {
+		return nil, fmt.Errorf("decode server key exchange: %w", err)
+	}
+	if serverMsg.Type != MsgKeyExchange {
+		return nil, fmt.Errorf("unexpected message type: %d", serverMsg.Type)
+	}
+	if len(serverMsg.Payload) != KeyExchangeNonceSize {
+		return nil, fmt.Errorf("invalid server nonce size: %d", len(serverMsg.Payload))
+	}
+
+	// Derive session key
+	sessionKey, err := DeriveSessionKey(c.sharedSecret, clientNonce, serverMsg.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("derive session key: %w", err)
+	}
+
+	// Create cipher
+	cipher, err := NewXChaCha20Cipher(sessionKey)
+	if err != nil {
+		return nil, fmt.Errorf("create cipher: %w", err)
+	}
+
+	return cipher, nil
 }
 
 func (c *Client) reconnect() bool {
@@ -286,6 +369,15 @@ func (c *Client) readLoop() {
 				return
 			}
 			continue
+		}
+
+		// Decrypt if cipher is configured
+		if c.cipher != nil {
+			data, err = c.cipher.Decrypt(data)
+			if err != nil {
+				logger.Error("decrypt message error", "error", err)
+				continue
+			}
 		}
 
 		msg, err := DecodeMessage(bytes.NewReader(data))

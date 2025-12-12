@@ -29,7 +29,7 @@ type Agent struct {
 	tunnels   map[string]*tunnel.Client // ruleID -> tunnel
 
 	tunnelServer  *tunnel.Server
-	signingSecret string
+	signingSecret string // also used as shared secret for key derivation
 	rules         []forward.Rule
 	rulesMu       sync.RWMutex
 
@@ -317,7 +317,7 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (*tunnel.Client, error) {
 		return nil, fmt.Errorf("get exit endpoint: %w", err)
 	}
 
-	wsURL := fmt.Sprintf("ws://%s:%d/tunnel", endpoint.Address, endpoint.WsPort)
+	wsURL := fmt.Sprintf("ws://%s/tunnel", net.JoinHostPort(endpoint.Address, fmt.Sprintf("%d", endpoint.WsPort)))
 
 	// Create endpoint refresher to handle exit agent restarts with port changes
 	refresher := func() (string, string, error) {
@@ -325,15 +325,21 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (*tunnel.Client, error) {
 		if err != nil {
 			return "", "", err
 		}
-		newURL := fmt.Sprintf("ws://%s:%d/tunnel", ep.Address, ep.WsPort)
+		newURL := fmt.Sprintf("ws://%s/tunnel", net.JoinHostPort(ep.Address, fmt.Sprintf("%d", ep.WsPort)))
 		return newURL, a.cfg.Token, nil
 	}
 
-	// Use agent's own token for handshake authentication
-	t := tunnel.NewClient(wsURL, a.cfg.Token, rule.ID,
-		tunnel.WithHeartbeatInterval(30*time.Second),
+	// Build client options with shared secret for forward-secure encryption
+	opts := []tunnel.ClientOption{
+		tunnel.WithHeartbeatInterval(30 * time.Second),
 		tunnel.WithEndpointRefresher(refresher, 3), // refresh after 3 failed attempts
-	)
+	}
+	if a.signingSecret != "" {
+		opts = append(opts, tunnel.WithSharedSecret(a.signingSecret))
+	}
+
+	// Use agent's own token for handshake authentication
+	t := tunnel.NewClient(wsURL, a.cfg.Token, rule.ID, opts...)
 
 	if err := t.Start(a.ctx); err != nil {
 		return nil, fmt.Errorf("start tunnel: %w", err)
@@ -354,7 +360,7 @@ func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (*tunnel.Client, 
 		return t, nil
 	}
 
-	wsURL := fmt.Sprintf("ws://%s:%d/tunnel", rule.NextHopAddress, rule.NextHopWsPort)
+	wsURL := fmt.Sprintf("ws://%s/tunnel", net.JoinHostPort(rule.NextHopAddress, fmt.Sprintf("%d", rule.NextHopWsPort)))
 
 	// Use NextHopConnectionToken if available (short-term token for chain authentication),
 	// otherwise fall back to agent's own token
@@ -363,9 +369,15 @@ func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (*tunnel.Client, 
 		token = a.cfg.Token
 	}
 
-	t := tunnel.NewClient(wsURL, token, rule.ID,
-		tunnel.WithHeartbeatInterval(30*time.Second),
-	)
+	// Build client options with shared secret for forward-secure encryption
+	opts := []tunnel.ClientOption{
+		tunnel.WithHeartbeatInterval(30 * time.Second),
+	}
+	if a.signingSecret != "" {
+		opts = append(opts, tunnel.WithSharedSecret(a.signingSecret))
+	}
+
+	t := tunnel.NewClient(wsURL, token, rule.ID, opts...)
 
 	if err := t.Start(a.ctx); err != nil {
 		return nil, fmt.Errorf("start tunnel: %w", err)
