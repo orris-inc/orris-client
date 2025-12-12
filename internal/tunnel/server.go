@@ -33,7 +33,7 @@ type Sender interface {
 // It accepts connections from Entry agents and forwards data to targets.
 type Server struct {
 	port          uint16
-	signingSecret string
+	signingSecret string // also used as shared secret for key derivation
 	rules         []forward.Rule
 
 	listener net.Listener
@@ -46,6 +46,7 @@ type Server struct {
 	connMu      sync.RWMutex
 	conns       map[*websocket.Conn]struct{}
 	connLock    map[*websocket.Conn]*sync.Mutex    // per-connection write lock
+	connCipher  map[*websocket.Conn]Cipher         // per-connection cipher
 	connHandler map[*websocket.Conn]MessageHandler // per-connection handler (by ruleID)
 
 	ctx    context.Context
@@ -62,6 +63,7 @@ func NewServer(port uint16, signingSecret string, rules []forward.Rule) *Server 
 		handlers:      make(map[string]MessageHandler),
 		conns:         make(map[*websocket.Conn]struct{}),
 		connLock:      make(map[*websocket.Conn]*sync.Mutex),
+		connCipher:    make(map[*websocket.Conn]Cipher),
 		connHandler:   make(map[*websocket.Conn]MessageHandler),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
@@ -146,6 +148,7 @@ func (s *Server) Stop() error {
 	}
 	s.conns = make(map[*websocket.Conn]struct{})
 	s.connLock = make(map[*websocket.Conn]*sync.Mutex)
+	s.connCipher = make(map[*websocket.Conn]Cipher)
 	s.connHandler = make(map[*websocket.Conn]MessageHandler)
 	s.connMu.Unlock()
 
@@ -167,17 +170,31 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create per-connection write lock
+	// Create per-connection write lock (cipher will be set after key exchange)
 	writeMu := &sync.Mutex{}
-	sender := &connSender{conn: conn, mu: writeMu}
 
-	// Perform handshake
-	ruleID, err := s.performHandshake(conn, sender)
+	// Perform handshake (without cipher yet)
+	ruleID, err := s.performHandshake(conn, writeMu)
 	if err != nil {
 		logger.Error("tunnel handshake failed", "remote", r.RemoteAddr, "error", err)
 		conn.Close()
 		return
 	}
+
+	// Perform key exchange if signing secret is configured
+	var cipher Cipher
+	if s.signingSecret != "" {
+		cipher, err = s.performKeyExchange(conn, writeMu)
+		if err != nil {
+			logger.Error("key exchange failed", "remote", r.RemoteAddr, "error", err)
+			conn.Close()
+			return
+		}
+		logger.Info("session key established with forward secrecy")
+	}
+
+	// Create sender with cipher
+	sender := &connSender{conn: conn, mu: writeMu, cipher: cipher}
 
 	// Get handler for this rule
 	s.handlerMu.RLock()
@@ -198,6 +215,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	s.connMu.Lock()
 	s.conns[conn] = struct{}{}
 	s.connLock[conn] = writeMu
+	s.connCipher[conn] = cipher
 	s.connHandler[conn] = handler
 	s.connMu.Unlock()
 
@@ -207,6 +225,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		s.connMu.Lock()
 		delete(s.conns, conn)
 		delete(s.connLock, conn)
+		delete(s.connCipher, conn)
 		delete(s.connHandler, conn)
 		s.connMu.Unlock()
 		conn.Close()
@@ -216,7 +235,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	s.readLoop(conn, sender, handler)
 }
 
-func (s *Server) performHandshake(conn *websocket.Conn, sender *connSender) (string, error) {
+func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (string, error) {
 	// Set read deadline for handshake
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
@@ -246,9 +265,9 @@ func (s *Server) performHandshake(conn *websocket.Conn, sender *connSender) (str
 			Error:   err.Error(),
 		}
 		resultData, _ := json.Marshal(failResult)
-		sender.mu.Lock()
+		writeMu.Lock()
 		conn.WriteMessage(websocket.TextMessage, resultData)
-		sender.mu.Unlock()
+		writeMu.Unlock()
 		return "", fmt.Errorf("verify handshake: %w", err)
 	}
 
@@ -257,15 +276,71 @@ func (s *Server) performHandshake(conn *websocket.Conn, sender *connSender) (str
 	if err != nil {
 		return "", fmt.Errorf("marshal result: %w", err)
 	}
-	sender.mu.Lock()
+	writeMu.Lock()
 	err = conn.WriteMessage(websocket.TextMessage, resultData)
-	sender.mu.Unlock()
+	writeMu.Unlock()
 	if err != nil {
 		return "", fmt.Errorf("send result: %w", err)
 	}
 
 	logger.Info("tunnel handshake verified", "rule_id", handshake.RuleID, "entry_agent_id", result.EntryAgentID)
 	return handshake.RuleID, nil
+}
+
+// performKeyExchange performs key exchange with client to establish session key.
+func (s *Server) performKeyExchange(conn *websocket.Conn, writeMu *sync.Mutex) (Cipher, error) {
+	// Receive client nonce
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, clientData, err := conn.ReadMessage()
+	if err != nil {
+		return nil, fmt.Errorf("read client key exchange: %w", err)
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	clientMsg, err := DecodeMessage(bytes.NewReader(clientData))
+	if err != nil {
+		return nil, fmt.Errorf("decode client key exchange: %w", err)
+	}
+	if clientMsg.Type != MsgKeyExchange {
+		return nil, fmt.Errorf("unexpected message type: %d", clientMsg.Type)
+	}
+	if len(clientMsg.Payload) != KeyExchangeNonceSize {
+		return nil, fmt.Errorf("invalid client nonce size: %d", len(clientMsg.Payload))
+	}
+	clientNonce := clientMsg.Payload
+
+	// Generate server nonce
+	serverNonce, err := GenerateNonce()
+	if err != nil {
+		return nil, fmt.Errorf("generate nonce: %w", err)
+	}
+
+	// Send server nonce
+	keyExMsg := NewKeyExchangeMessage(serverNonce)
+	keyExData, err := keyExMsg.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("encode key exchange: %w", err)
+	}
+	writeMu.Lock()
+	err = conn.WriteMessage(websocket.BinaryMessage, keyExData)
+	writeMu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("send key exchange: %w", err)
+	}
+
+	// Derive session key
+	sessionKey, err := DeriveSessionKey(s.signingSecret, clientNonce, serverNonce)
+	if err != nil {
+		return nil, fmt.Errorf("derive session key: %w", err)
+	}
+
+	// Create cipher
+	cipher, err := NewXChaCha20Cipher(sessionKey)
+	if err != nil {
+		return nil, fmt.Errorf("create cipher: %w", err)
+	}
+
+	return cipher, nil
 }
 
 func (s *Server) readLoop(conn *websocket.Conn, sender *connSender, handler MessageHandler) {
@@ -282,6 +357,15 @@ func (s *Server) readLoop(conn *websocket.Conn, sender *connSender, handler Mess
 				logger.Error("tunnel read error", "error", err)
 			}
 			return
+		}
+
+		// Decrypt if cipher is configured
+		if sender.cipher != nil {
+			data, err = sender.cipher.Decrypt(data)
+			if err != nil {
+				logger.Error("decrypt message error", "error", err)
+				continue
+			}
 		}
 
 		msg, err := DecodeMessage(bytes.NewReader(data))
@@ -318,14 +402,23 @@ func (s *Server) handleMessage(sender *connSender, handler MessageHandler, msg *
 // connSender implements Sender for a WebSocket connection.
 // All connSender instances for the same connection share the same mutex.
 type connSender struct {
-	conn *websocket.Conn
-	mu   *sync.Mutex // shared per-connection write lock
+	conn   *websocket.Conn
+	mu     *sync.Mutex // shared per-connection write lock
+	cipher Cipher      // optional encryption cipher
 }
 
 func (s *connSender) SendMessage(msg *Message) error {
 	data, err := msg.Encode()
 	if err != nil {
 		return fmt.Errorf("encode message: %w", err)
+	}
+
+	// Encrypt if cipher is configured
+	if s.cipher != nil {
+		data, err = s.cipher.Encrypt(data)
+		if err != nil {
+			return fmt.Errorf("encrypt message: %w", err)
+		}
 	}
 
 	s.mu.Lock()

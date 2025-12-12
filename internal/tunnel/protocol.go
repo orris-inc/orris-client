@@ -20,6 +20,13 @@ const (
 	MsgPing MessageType = 4
 	// MsgPong is a heartbeat response.
 	MsgPong MessageType = 5
+	// MsgKeyExchange exchanges nonce for session key derivation.
+	MsgKeyExchange MessageType = 6
+)
+
+const (
+	// KeyExchangeNonceSize is the size of nonce for key exchange (32 bytes).
+	KeyExchangeNonceSize = 32
 )
 
 // Message represents a message in the tunnel protocol.
@@ -148,6 +155,14 @@ func NewPingMessage() *Message {
 func NewPongMessage() *Message {
 	return &Message{
 		Type: MsgPong,
+	}
+}
+
+// NewKeyExchangeMessage creates a key exchange message with nonce.
+func NewKeyExchangeMessage(nonce []byte) *Message {
+	return &Message{
+		Type:    MsgKeyExchange,
+		Payload: nonce,
 	}
 }
 
