@@ -272,6 +272,16 @@ func (a *Agent) startForwarder(rule *forward.Rule) error {
 			return fmt.Errorf("unknown role %q for chain rule", rule.Role)
 		}
 
+	case forward.RuleTypeDirectChain:
+		// Handle direct chain rule - uses direct TCP/UDP connections instead of WS tunnels
+		// All roles (entry, relay, exit) use the same DirectChainForwarder
+		// The difference is in NextHopAddress/NextHopPort vs TargetAddress/TargetPort
+		dcf := forwarder.NewDirectChainForwarder(rule)
+		if err := dcf.Start(a.ctx); err != nil {
+			return err
+		}
+		f = dcf
+
 	default:
 		return fmt.Errorf("unknown rule type: %s", rule.RuleType)
 	}
@@ -321,7 +331,6 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (*tunnel.Client, error) {
 
 	// Use agent's own token for handshake authentication
 	t := tunnel.NewClient(wsURL, a.cfg.Token, rule.ID,
-		tunnel.WithReconnectInterval(5*time.Second),
 		tunnel.WithHeartbeatInterval(30*time.Second),
 		tunnel.WithEndpointRefresher(refresher, 3), // refresh after 3 failed attempts
 	)
@@ -355,7 +364,6 @@ func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (*tunnel.Client, 
 	}
 
 	t := tunnel.NewClient(wsURL, token, rule.ID,
-		tunnel.WithReconnectInterval(5*time.Second),
 		tunnel.WithHeartbeatInterval(30*time.Second),
 	)
 
@@ -381,6 +389,9 @@ func (a *Agent) ensureTunnelServer() error {
 
 	// Update config with actual port (important when port was 0)
 	a.cfg.WsListenPort = a.tunnelServer.Port()
+
+	// Immediately report status with new port so entry agents can reconnect
+	go a.reportStatus()
 
 	return nil
 }
@@ -937,6 +948,7 @@ func ruleSyncDataToRule(data *forward.RuleSyncData) *forward.Rule {
 		NextHopAgentID: data.NextHopAgentID,
 		NextHopAddress: data.NextHopAddress,
 		NextHopWsPort:  data.NextHopWsPort,
+		NextHopPort:    data.NextHopPort,
 		ChainAgentIDs:  data.ChainAgentIDs,
 		ChainPosition:  data.ChainPosition,
 		IsLastInChain:  data.IsLastInChain,
