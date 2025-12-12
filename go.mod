@@ -4,11 +4,12 @@ go 1.24.3
 
 require github.com/spf13/pflag v1.0.10
 
-require github.com/orris-inc/orris/sdk/forward v0.0.0-20251212043459-71e88475ae34
+require github.com/orris-inc/orris/sdk/forward v0.0.0-20251212090404-5f9a03c704f3
 
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/shirou/gopsutil/v4 v4.25.11
+	golang.org/x/crypto v0.46.0
 )
 
 require (
@@ -20,6 +21,5 @@ require (
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
-	golang.org/x/crypto v0.46.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 )
