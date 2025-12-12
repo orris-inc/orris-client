@@ -200,12 +200,18 @@ func (f *DirectChainForwarder) handleTCPConn(clientConn net.Conn, nextHop string
 	defer f.wg.Done()
 	defer clientConn.Close()
 
-	// Connect to next hop
-	upstreamConn, err := net.DialTimeout("tcp", nextHop, 10*time.Second)
+	// Connect to next hop with optional bind IP
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	if f.rule.BindIP != "" {
+		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(f.rule.BindIP)}
+	}
+
+	upstreamConn, err := dialer.Dial("tcp", nextHop)
 	if err != nil {
 		logger.Error("direct chain tcp dial failed",
 			"rule_id", f.rule.ID,
 			"next_hop", nextHop,
+			"bind_ip", f.rule.BindIP,
 			"error", err)
 		return
 	}
@@ -293,7 +299,7 @@ func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nex
 		return client
 	}
 
-	// Create new upstream connection
+	// Create new upstream connection with optional bind IP
 	upstreamAddr, err := net.ResolveUDPAddr("udp", nextHop)
 	if err != nil {
 		logger.Error("direct chain resolve upstream addr failed",
@@ -302,10 +308,16 @@ func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nex
 		return nil
 	}
 
-	upstream, err := net.DialUDP("udp", nil, upstreamAddr)
+	var localAddr *net.UDPAddr
+	if f.rule.BindIP != "" {
+		localAddr = &net.UDPAddr{IP: net.ParseIP(f.rule.BindIP)}
+	}
+
+	upstream, err := net.DialUDP("udp", localAddr, upstreamAddr)
 	if err != nil {
 		logger.Error("direct chain udp dial upstream failed",
 			"next_hop", nextHop,
+			"bind_ip", f.rule.BindIP,
 			"error", err)
 		return nil
 	}

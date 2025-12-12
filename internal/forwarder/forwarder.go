@@ -192,9 +192,15 @@ func (f *DirectForwarder) handleConn(clientConn net.Conn) {
 	defer clientConn.Close()
 
 	targetAddr := net.JoinHostPort(f.rule.TargetAddress, fmt.Sprintf("%d", f.rule.TargetPort))
-	targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	if f.rule.BindIP != "" {
+		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(f.rule.BindIP)}
+	}
+
+	targetConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
-		logger.Error("direct dial target failed", "target", targetAddr, "error", err)
+		logger.Error("direct dial target failed", "target", targetAddr, "bind_ip", f.rule.BindIP, "error", err)
 		return
 	}
 	defer targetConn.Close()
@@ -487,9 +493,15 @@ func (f *ExitForwarder) RuleID() string {
 // HandleConnect handles connect message from tunnel.
 func (f *ExitForwarder) HandleConnect(connID uint64) {
 	targetAddr := net.JoinHostPort(f.rule.TargetAddress, fmt.Sprintf("%d", f.rule.TargetPort))
-	targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	if f.rule.BindIP != "" {
+		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(f.rule.BindIP)}
+	}
+
+	targetConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
-		logger.Error("exit dial target failed", "conn_id", connID, "target", targetAddr, "error", err)
+		logger.Error("exit dial target failed", "conn_id", connID, "target", targetAddr, "bind_ip", f.rule.BindIP, "error", err)
 		if f.tunnel != nil {
 			f.tunnel.SendMessage(tunnel.NewCloseMessage(connID))
 		}
