@@ -36,7 +36,7 @@ type Client struct {
 	writeMu sync.Mutex
 	handler DataHandler
 
-	reconnectInterval    time.Duration
+	backoff              *Backoff
 	heartbeatInterval    time.Duration
 	refreshAfterAttempts int // refresh endpoint after this many failed reconnect attempts
 	endpointRefresher    EndpointRefresher
@@ -49,10 +49,10 @@ type Client struct {
 // ClientOption configures Client.
 type ClientOption func(*Client)
 
-// WithReconnectInterval sets the reconnect interval.
-func WithReconnectInterval(d time.Duration) ClientOption {
+// WithBackoff sets the backoff configuration for reconnection.
+func WithBackoff(b *Backoff) ClientOption {
 	return func(c *Client) {
-		c.reconnectInterval = d
+		c.backoff = b
 	}
 }
 
@@ -79,7 +79,7 @@ func NewClient(endpoint, token, ruleID string, opts ...ClientOption) *Client {
 		endpoint:          endpoint,
 		token:             token,
 		ruleID:            ruleID,
-		reconnectInterval: 5 * time.Second,
+		backoff:           DefaultBackoff(),
 		heartbeatInterval: 30 * time.Second,
 	}
 	for _, opt := range opts {
@@ -226,21 +226,24 @@ func (c *Client) connect() error {
 }
 
 func (c *Client) reconnect() bool {
-	failedAttempts := 0
 	for {
+		interval := c.backoff.Next()
+		attempt := c.backoff.Attempt()
+
+		logger.Info("reconnecting with backoff",
+			"attempt", attempt,
+			"interval", interval.Round(time.Millisecond))
+
 		select {
 		case <-c.ctx.Done():
 			return false
-		case <-time.After(c.reconnectInterval):
+		case <-time.After(interval):
 		}
-
-		failedAttempts++
-		logger.Info("attempting to reconnect...", "attempt", failedAttempts)
 
 		// Try to refresh endpoint after configured number of failed attempts
 		if c.endpointRefresher != nil && c.refreshAfterAttempts > 0 &&
-			failedAttempts%c.refreshAfterAttempts == 0 {
-			logger.Info("refreshing endpoint after failed reconnect attempts", "attempts", failedAttempts)
+			attempt%c.refreshAfterAttempts == 0 {
+			logger.Info("refreshing endpoint after failed reconnect attempts", "attempts", attempt)
 			if newEndpoint, newToken, err := c.endpointRefresher(); err != nil {
 				logger.Error("endpoint refresh failed", "error", err)
 			} else {
@@ -255,9 +258,13 @@ func (c *Client) reconnect() bool {
 		}
 
 		if err := c.connect(); err != nil {
-			logger.Error("reconnect failed", "error", err)
+			logger.Error("reconnect failed", "error", err, "attempt", attempt)
 			continue
 		}
+
+		// Reset backoff on successful reconnection
+		c.backoff.Reset()
+		logger.Info("reconnected successfully after attempts", "attempts", attempt)
 		return true
 	}
 }
