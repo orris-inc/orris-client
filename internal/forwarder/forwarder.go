@@ -21,6 +21,57 @@ func isClosedError(err error) bool {
 	return errors.Is(err, net.ErrClosed)
 }
 
+// bufferSize is the size of the buffer used for copying data.
+const bufferSize = 32 * 1024
+
+// bufPool is a pool of buffers used for copying data to reduce GC pressure.
+var bufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, bufferSize)
+		return &buf
+	},
+}
+
+// copyBuffer copies data from src to dst using a pooled buffer.
+// It calls trafficFn with the number of bytes written after each write.
+// It respects context cancellation by checking ctx.Done() between reads.
+func copyBuffer(ctx context.Context, dst io.Writer, src io.Reader, trafficFn func(int64)) (int64, error) {
+	bufp := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bufp)
+
+	var written int64
+	for {
+		select {
+		case <-ctx.Done():
+			return written, ctx.Err()
+		default:
+		}
+
+		nr, rerr := src.Read(*bufp)
+		if nr > 0 {
+			nw, werr := dst.Write((*bufp)[:nr])
+			if nw > 0 {
+				written += int64(nw)
+				if trafficFn != nil {
+					trafficFn(int64(nw))
+				}
+			}
+			if werr != nil {
+				return written, werr
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return written, nil
+			}
+			return written, rerr
+		}
+	}
+}
+
 // Forwarder is an interface for all forwarder types.
 type Forwarder interface {
 	Start(ctx context.Context) error
@@ -154,8 +205,7 @@ func (f *DirectForwarder) handleConn(clientConn net.Conn) {
 	// Client -> Target (upload)
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(targetConn, clientConn)
-		f.traffic.AddUpload(n)
+		copyBuffer(f.ctx, targetConn, clientConn, f.traffic.AddUpload)
 		if tc, ok := targetConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -164,8 +214,7 @@ func (f *DirectForwarder) handleConn(clientConn net.Conn) {
 	// Target -> Client (download)
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(clientConn, targetConn)
-		f.traffic.AddDownload(n)
+		copyBuffer(f.ctx, clientConn, targetConn, f.traffic.AddDownload)
 		if tc, ok := clientConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -328,7 +377,10 @@ func (f *EntryForwarder) handleConn(clientConn net.Conn) {
 		return
 	}
 
-	buf := make([]byte, 32*1024)
+	bufp := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bufp)
+	buf := *bufp
+
 	for {
 		select {
 		case <-f.ctx.Done():
@@ -482,7 +534,10 @@ func (f *ExitForwarder) readFromTarget(connID uint64, targetConn net.Conn) {
 	defer f.wg.Done()
 	defer f.closeConn(connID)
 
-	buf := make([]byte, 32*1024)
+	bufp := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bufp)
+	buf := *bufp
+
 	for {
 		select {
 		case <-f.ctx.Done():
