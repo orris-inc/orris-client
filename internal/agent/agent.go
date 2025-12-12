@@ -755,6 +755,16 @@ func (a *Agent) handleConfigSync(conn *forward.HubConn, data *forward.ConfigSync
 
 // handleFullSync handles full configuration sync.
 func (a *Agent) handleFullSync(data *forward.ConfigSyncData) error {
+	// Update token info from full sync (ensures agent always has correct token)
+	a.rulesMu.Lock()
+	if data.ClientToken != "" {
+		a.clientToken = data.ClientToken
+	}
+	if data.TokenSigningSecret != "" {
+		a.signingSecret = data.TokenSigningSecret
+	}
+	a.rulesMu.Unlock()
+
 	// Build rule map from added rules
 	newRules := make(map[string]*forward.Rule)
 	for i := range data.Added {
