@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/orris-inc/orris/sdk/forward"
+	"github.com/orris-inc/orris-client/internal/forward"
 
 	"github.com/orris-inc/orris-client/internal/logger"
 )
@@ -32,9 +32,10 @@ type Sender interface {
 // Server is a WebSocket tunnel server for Exit agents.
 // It accepts connections from Entry agents and forwards data to targets.
 type Server struct {
-	port          uint16
-	signingSecret string // also used as shared secret for key derivation
-	rules         []forward.Rule
+	port              uint16
+	signingSecret     string // used for token verification and key derivation
+	disableEncryption bool   // if true, skip key exchange (but still verify tokens)
+	rules             []forward.Rule
 
 	listener net.Listener
 	server   *http.Server
@@ -55,17 +56,20 @@ type Server struct {
 }
 
 // NewServer creates a new tunnel server.
-func NewServer(port uint16, signingSecret string, rules []forward.Rule) *Server {
+func NewServer(port uint16, signingSecret string, disableEncryption bool, rules []forward.Rule) *Server {
 	return &Server{
-		port:          port,
-		signingSecret: signingSecret,
-		rules:         rules,
-		handlers:      make(map[string]MessageHandler),
-		conns:         make(map[*websocket.Conn]struct{}),
-		connLock:      make(map[*websocket.Conn]*sync.Mutex),
-		connCipher:    make(map[*websocket.Conn]Cipher),
-		connHandler:   make(map[*websocket.Conn]MessageHandler),
+		port:              port,
+		signingSecret:     signingSecret,
+		disableEncryption: disableEncryption,
+		rules:             rules,
+		handlers:          make(map[string]MessageHandler),
+		conns:             make(map[*websocket.Conn]struct{}),
+		connLock:          make(map[*websocket.Conn]*sync.Mutex),
+		connCipher:        make(map[*websocket.Conn]Cipher),
+		connHandler:       make(map[*websocket.Conn]MessageHandler),
 		upgrader: websocket.Upgrader{
+			ReadBufferSize:  64 * 1024,
+			WriteBufferSize: 64 * 1024,
 			CheckOrigin: func(r *http.Request) bool {
 				return true
 			},
@@ -181,9 +185,9 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Perform key exchange if signing secret is configured
+	// Perform key exchange unless encryption is disabled
 	var cipher Cipher
-	if s.signingSecret != "" {
+	if !s.disableEncryption && s.signingSecret != "" {
 		cipher, err = s.performKeyExchange(conn, writeMu)
 		if err != nil {
 			logger.Error("key exchange failed", "remote", r.RemoteAddr, "error", err)
@@ -196,15 +200,27 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	// Create sender with cipher
 	sender := &connSender{conn: conn, mu: writeMu, cipher: cipher}
 
-	// Get handler for this rule
-	s.handlerMu.RLock()
-	handler, ok := s.handlers[ruleID]
-	s.handlerMu.RUnlock()
+	// Get handler for this rule, with retry for startup race condition
+	// Handler may not be registered yet if forwarder is still connecting to next hop
+	var handler MessageHandler
+	for i := 0; i < 10; i++ {
+		s.handlerMu.RLock()
+		h, ok := s.handlers[ruleID]
+		s.handlerMu.RUnlock()
 
-	if !ok {
-		logger.Error("no handler for rule", "rule_id", ruleID)
-		conn.Close()
-		return
+		if ok {
+			handler = h
+			break
+		}
+
+		if i == 9 {
+			logger.Error("no handler for rule after retries", "rule_id", ruleID)
+			conn.Close()
+			return
+		}
+
+		logger.Debug("handler not ready, waiting", "rule_id", ruleID, "attempt", i+1)
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	// Set sender for the handler
@@ -251,11 +267,33 @@ func (s *Server) performHandshake(conn *websocket.Conn, writeMu *sync.Mutex) (st
 		return "", fmt.Errorf("unmarshal handshake: %w", err)
 	}
 
+	// Log received token info for debugging
+	tokenDbg := handshake.AgentToken
+	if len(tokenDbg) > 15 {
+		tokenDbg = tokenDbg[:15] + "..."
+	}
+	logger.Debug("received tunnel handshake", "rule_id", handshake.RuleID, "token_prefix", tokenDbg)
+
 	// Verify handshake
 	s.connMu.RLock()
 	rules := s.rules
 	signingSecret := s.signingSecret
 	s.connMu.RUnlock()
+
+	logger.Debug("verifying handshake", "rules_count", len(rules), "has_signing_secret", signingSecret != "")
+
+	// Log rule details for debugging
+	for _, rule := range rules {
+		if rule.ID == handshake.RuleID {
+			logger.Debug("matching rule found",
+				"rule_id", rule.ID,
+				"rule_type", rule.RuleType,
+				"role", rule.Role,
+				"agent_id", rule.AgentID,
+				"chain_position", rule.ChainPosition,
+				"chain_agent_ids", rule.ChainAgentIDs)
+		}
+	}
 
 	result, err := forward.VerifyTunnelHandshake(&handshake, signingSecret, rules)
 	if err != nil {

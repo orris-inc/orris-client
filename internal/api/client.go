@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/orris-inc/orris/sdk/forward"
+	"github.com/orris-inc/orris-client/internal/forward"
 )
 
 type Client struct {
@@ -23,6 +23,10 @@ func (c *Client) ForwardClient() *forward.Client {
 
 func (c *Client) GetRules(ctx context.Context) (*forward.RulesResponse, error) {
 	return c.fc.GetRules(ctx)
+}
+
+func (c *Client) RefreshRule(ctx context.Context, ruleID string) (*forward.Rule, error) {
+	return c.fc.RefreshRule(ctx, ruleID)
 }
 
 func (c *Client) ReportTraffic(ctx context.Context, items []forward.TrafficItem) error {

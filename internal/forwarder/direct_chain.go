@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/orris-inc/orris/sdk/forward"
+	"github.com/orris-inc/orris-client/internal/forward"
 
 	"github.com/orris-inc/orris-client/internal/logger"
 )
@@ -50,6 +50,16 @@ func NewDirectChainForwarder(rule *forward.Rule) *DirectChainForwarder {
 // Start starts the direct chain forwarder.
 func (f *DirectChainForwarder) Start(ctx context.Context) error {
 	f.ctx, f.cancel = context.WithCancel(ctx)
+
+	// Log rule details for debugging
+	logger.Debug("direct chain rule details",
+		"rule_id", f.rule.ID,
+		"role", f.rule.Role,
+		"is_last_in_chain", f.rule.IsLastInChain,
+		"next_hop_address", f.rule.NextHopAddress,
+		"next_hop_port", f.rule.NextHopPort,
+		"target_address", f.rule.TargetAddress,
+		"target_port", f.rule.TargetPort)
 
 	// Determine next hop address
 	var nextHop string

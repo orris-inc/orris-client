@@ -10,7 +10,7 @@ import (
 	"github.com/shirou/gopsutil/v4/mem"
 	"github.com/shirou/gopsutil/v4/net"
 
-	"github.com/orris-inc/orris/sdk/forward"
+	"github.com/orris-inc/orris-client/internal/forward"
 )
 
 // Collector collects system status information.

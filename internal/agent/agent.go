@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/orris-inc/orris/sdk/forward"
+	"github.com/orris-inc/orris-client/internal/forward"
 
 	"github.com/orris-inc/orris-client/internal/api"
 	"github.com/orris-inc/orris-client/internal/config"
@@ -125,6 +125,9 @@ func (a *Agent) syncRules() error {
 	a.signingSecret = resp.TokenSigningSecret
 	if resp.ClientToken != "" {
 		a.clientToken = resp.ClientToken
+		logger.Debug("clientToken synced from API", "token_prefix", tokenPrefix(resp.ClientToken))
+	} else {
+		logger.Debug("API returned empty clientToken")
 	}
 	a.rules = rules
 	a.rulesMu.Unlock()
@@ -305,9 +308,19 @@ func (a *Agent) getHandshakeToken() string {
 	token := a.clientToken
 	a.rulesMu.RUnlock()
 	if token != "" {
+		logger.Debug("using clientToken for handshake", "token_prefix", tokenPrefix(token))
 		return token
 	}
+	logger.Debug("using cfg.Token for handshake (clientToken empty)", "token_prefix", tokenPrefix(a.cfg.Token))
 	return a.cfg.Token
+}
+
+// tokenPrefix returns the first 10 chars of token for logging (safe prefix).
+func tokenPrefix(token string) string {
+	if len(token) <= 10 {
+		return token
+	}
+	return token[:10] + "..."
 }
 
 func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (*tunnel.Client, error) {
@@ -349,8 +362,9 @@ func (a *Agent) getOrCreateTunnel(rule *forward.Rule) (*tunnel.Client, error) {
 	opts := []tunnel.ClientOption{
 		tunnel.WithHeartbeatInterval(30 * time.Second),
 		tunnel.WithEndpointRefresher(refresher, 3), // refresh after 3 failed attempts
+		tunnel.WithInitialRetry(6),                 // retry up to 6 times for initial connection
 	}
-	if a.signingSecret != "" {
+	if a.signingSecret != "" && !a.cfg.DisableEncryption {
 		opts = append(opts, tunnel.WithSharedSecret(a.signingSecret))
 	}
 
@@ -382,14 +396,48 @@ func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (*tunnel.Client, 
 	// otherwise fall back to agent's own token (prefer API-provided token)
 	token := rule.NextHopConnectionToken
 	if token == "" {
+		logger.Debug("NextHopConnectionToken empty, falling back to handshake token",
+			"rule_id", rule.ID, "rule_type", rule.RuleType, "role", rule.Role)
 		token = a.getHandshakeToken()
+	} else {
+		logger.Debug("using NextHopConnectionToken",
+			"rule_id", rule.ID, "token_prefix", tokenPrefix(token))
+	}
+
+	// Create endpoint refresher for chain rules
+	ruleID := rule.ID
+	refresher := func() (string, string, error) {
+		refreshedRule, err := a.client.RefreshRule(a.ctx, ruleID)
+		if err != nil {
+			return "", "", fmt.Errorf("refresh rule: %w", err)
+		}
+
+		// Update local rule cache
+		a.updateRuleCache(refreshedRule)
+
+		newURL := fmt.Sprintf("ws://%s/tunnel",
+			net.JoinHostPort(refreshedRule.NextHopAddress, fmt.Sprintf("%d", refreshedRule.NextHopWsPort)))
+
+		// Use refreshed token if available
+		newToken := refreshedRule.NextHopConnectionToken
+		if newToken == "" {
+			newToken = a.getHandshakeToken()
+		}
+
+		logger.Info("endpoint refreshed for chain rule",
+			"rule_id", ruleID,
+			"new_endpoint", newURL)
+
+		return newURL, newToken, nil
 	}
 
 	// Build client options with shared secret for forward-secure encryption
 	opts := []tunnel.ClientOption{
 		tunnel.WithHeartbeatInterval(30 * time.Second),
+		tunnel.WithEndpointRefresher(refresher, 3), // refresh after 3 failed attempts
+		tunnel.WithInitialRetry(6),                 // retry up to 6 times for initial connection
 	}
-	if a.signingSecret != "" {
+	if a.signingSecret != "" && !a.cfg.DisableEncryption {
 		opts = append(opts, tunnel.WithSharedSecret(a.signingSecret))
 	}
 
@@ -403,6 +451,20 @@ func (a *Agent) getOrCreateTunnelByAddress(rule *forward.Rule) (*tunnel.Client, 
 	return t, nil
 }
 
+// updateRuleCache updates the local rule cache with refreshed rule data.
+func (a *Agent) updateRuleCache(rule *forward.Rule) {
+	a.rulesMu.Lock()
+	defer a.rulesMu.Unlock()
+
+	for i := range a.rules {
+		if a.rules[i].ID == rule.ID {
+			a.rules[i] = *rule
+			logger.Debug("rule cache updated", "rule_id", rule.ID)
+			return
+		}
+	}
+}
+
 // ensureTunnelServer ensures the tunnel server is started.
 // If WsListenPort is 0, a random available port will be used.
 func (a *Agent) ensureTunnelServer() error {
@@ -410,7 +472,9 @@ func (a *Agent) ensureTunnelServer() error {
 		return nil
 	}
 
-	a.tunnelServer = tunnel.NewServer(a.cfg.WsListenPort, a.signingSecret, a.rules)
+	// signingSecret is always needed for token verification
+	// DisableEncryption only affects key exchange, not authentication
+	a.tunnelServer = tunnel.NewServer(a.cfg.WsListenPort, a.signingSecret, a.cfg.DisableEncryption, a.rules)
 	if err := a.tunnelServer.Start(a.ctx); err != nil {
 		return fmt.Errorf("start tunnel server: %w", err)
 	}
@@ -975,21 +1039,22 @@ func (a *Agent) probeTunnelByRule(ruleID string) (bool, string) {
 // ruleSyncDataToRule converts RuleSyncData to forward.Rule.
 func ruleSyncDataToRule(data *forward.RuleSyncData) *forward.Rule {
 	return &forward.Rule{
-		ID:             data.ID,
-		AgentID:        data.AgentID,
-		RuleType:       forward.RuleType(data.RuleType),
-		ListenPort:     data.ListenPort,
-		TargetAddress:  data.TargetAddress,
-		TargetPort:     data.TargetPort,
-		BindIP:         data.BindIP,
-		Protocol:       data.Protocol,
-		Role:           data.Role,
-		NextHopAgentID: data.NextHopAgentID,
-		NextHopAddress: data.NextHopAddress,
-		NextHopWsPort:  data.NextHopWsPort,
-		NextHopPort:    data.NextHopPort,
-		ChainAgentIDs:  data.ChainAgentIDs,
-		ChainPosition:  data.ChainPosition,
-		IsLastInChain:  data.IsLastInChain,
+		ID:                     data.ID,
+		AgentID:                data.AgentID,
+		RuleType:               forward.RuleType(data.RuleType),
+		ListenPort:             data.ListenPort,
+		TargetAddress:          data.TargetAddress,
+		TargetPort:             data.TargetPort,
+		BindIP:                 data.BindIP,
+		Protocol:               data.Protocol,
+		Role:                   data.Role,
+		NextHopAgentID:         data.NextHopAgentID,
+		NextHopAddress:         data.NextHopAddress,
+		NextHopWsPort:          data.NextHopWsPort,
+		NextHopPort:            data.NextHopPort,
+		NextHopConnectionToken: data.NextHopConnectionToken,
+		ChainAgentIDs:          data.ChainAgentIDs,
+		ChainPosition:          data.ChainPosition,
+		IsLastInChain:          data.IsLastInChain,
 	}
 }

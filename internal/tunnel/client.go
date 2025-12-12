@@ -5,11 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/orris-inc/orris/sdk/forward"
+	"github.com/orris-inc/orris-client/internal/forward"
 
 	"github.com/orris-inc/orris-client/internal/logger"
 )
@@ -41,6 +42,7 @@ type Client struct {
 	backoff              *Backoff
 	heartbeatInterval    time.Duration
 	refreshAfterAttempts int // refresh endpoint after this many failed reconnect attempts
+	initialRetryMax      int // max retries for initial connection (0 = no retry)
 	endpointRefresher    EndpointRefresher
 
 	ctx    context.Context
@@ -72,6 +74,15 @@ func WithEndpointRefresher(refresher EndpointRefresher, refreshAfterAttempts int
 	return func(c *Client) {
 		c.endpointRefresher = refresher
 		c.refreshAfterAttempts = refreshAfterAttempts
+	}
+}
+
+// WithInitialRetry sets the maximum number of retries for initial connection.
+// If set to 0 (default), initial connection failure returns error immediately.
+// If set to > 0, will retry with backoff and endpoint refresh before failing.
+func WithInitialRetry(maxRetries int) ClientOption {
+	return func(c *Client) {
+		c.initialRetryMax = maxRetries
 	}
 }
 
@@ -107,7 +118,7 @@ func (c *Client) SetHandler(h DataHandler) {
 func (c *Client) Start(ctx context.Context) error {
 	c.ctx, c.cancel = context.WithCancel(ctx)
 
-	if err := c.connect(); err != nil {
+	if err := c.connectWithRetry(); err != nil {
 		return fmt.Errorf("initial connection failed: %w", err)
 	}
 
@@ -116,6 +127,69 @@ func (c *Client) Start(ctx context.Context) error {
 	go c.heartbeatLoop()
 
 	return nil
+}
+
+// connectWithRetry attempts to connect with retries and endpoint refresh.
+func (c *Client) connectWithRetry() error {
+	err := c.connect()
+	if err == nil {
+		return nil
+	}
+
+	// If no retry configured, fail immediately
+	if c.initialRetryMax <= 0 {
+		return err
+	}
+
+	logger.Warn("initial connection failed, will retry", "error", err, "max_retries", c.initialRetryMax)
+
+	for attempt := 1; attempt <= c.initialRetryMax; attempt++ {
+		select {
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		default:
+		}
+
+		// Try to refresh endpoint before retry
+		if c.endpointRefresher != nil && c.refreshAfterAttempts > 0 &&
+			attempt%c.refreshAfterAttempts == 0 {
+			logger.Info("refreshing endpoint before retry", "attempt", attempt)
+			if newEndpoint, newToken, refreshErr := c.endpointRefresher(); refreshErr != nil {
+				logger.Error("endpoint refresh failed", "error", refreshErr)
+			} else {
+				c.endpointMu.Lock()
+				if newEndpoint != c.endpoint {
+					logger.Info("endpoint updated", "old", c.endpoint, "new", newEndpoint)
+					c.endpoint = newEndpoint
+					c.token = newToken
+				}
+				c.endpointMu.Unlock()
+			}
+		}
+
+		interval := c.backoff.Next()
+		logger.Info("retrying initial connection",
+			"attempt", attempt,
+			"max_retries", c.initialRetryMax,
+			"interval", interval.Round(time.Millisecond))
+
+		select {
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		case <-time.After(interval):
+		}
+
+		err = c.connect()
+		if err == nil {
+			c.backoff.Reset()
+			logger.Info("initial connection succeeded after retries", "attempts", attempt)
+			return nil
+		}
+
+		logger.Warn("initial connection retry failed", "attempt", attempt, "error", err)
+	}
+
+	return fmt.Errorf("max retries (%d) exceeded: %w", c.initialRetryMax, err)
 }
 
 // Stop stops the tunnel client.
@@ -182,6 +256,8 @@ func (c *Client) connect() error {
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
+		ReadBufferSize:   64 * 1024,
+		WriteBufferSize:  64 * 1024,
 	}
 
 	header := make(map[string][]string)
@@ -197,6 +273,19 @@ func (c *Client) connect() error {
 		AgentToken: token,
 		RuleID:     ruleID,
 	}
+
+	// Log token info for debugging (only prefix for security)
+	tokenDbg := token
+	if len(tokenDbg) > 15 {
+		tokenDbg = tokenDbg[:15] + "..."
+	}
+	tokenParts := strings.SplitN(token, "_", 3)
+	logger.Debug("sending tunnel handshake",
+		"rule_id", ruleID,
+		"token_prefix", tokenDbg,
+		"token_len", len(token),
+		"token_parts", len(tokenParts))
+
 	handshakeData, err := json.Marshal(handshake)
 	if err != nil {
 		conn.Close()
@@ -365,6 +454,16 @@ func (c *Client) readLoop() {
 		_, data, err := c.conn.ReadMessage()
 		if err != nil {
 			logger.Error("tunnel read error", "error", err)
+
+			// Clear connection immediately to prevent SendMessage from using broken conn
+			c.writeMu.Lock()
+			if c.conn != nil {
+				c.conn.Close()
+				c.conn = nil
+			}
+			c.cipher = nil
+			c.writeMu.Unlock()
+
 			if !c.reconnect() {
 				return
 			}
