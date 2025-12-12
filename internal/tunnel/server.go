@@ -19,6 +19,7 @@ import (
 // MessageHandler handles messages from tunnel clients.
 type MessageHandler interface {
 	HandleConnect(connID uint64)
+	HandleConnectWithPayload(connID uint64, payload []byte) // For UDP connections with client address
 	HandleData(connID uint64, data []byte)
 	HandleClose(connID uint64)
 }
@@ -296,7 +297,12 @@ func (s *Server) readLoop(conn *websocket.Conn, sender *connSender, handler Mess
 func (s *Server) handleMessage(sender *connSender, handler MessageHandler, msg *Message) {
 	switch msg.Type {
 	case MsgConnect:
-		handler.HandleConnect(msg.ConnID)
+		// UDP connections have payload (client address), TCP connections don't
+		if len(msg.Payload) > 0 {
+			handler.HandleConnectWithPayload(msg.ConnID, msg.Payload)
+		} else {
+			handler.HandleConnect(msg.ConnID)
+		}
 	case MsgData:
 		handler.HandleData(msg.ConnID, msg.Payload)
 	case MsgClose:

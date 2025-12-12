@@ -37,6 +37,30 @@ const (
 	MaxPayloadSize = 64 * 1024 // 64KB
 )
 
+// ConnID protocol flags - use bit 63 to distinguish TCP/UDP
+// This is backward compatible: existing TCP connections have bit 63 = 0
+const (
+	// ConnIDProtocolUDP marks a connection ID as UDP (bit 63 set)
+	ConnIDProtocolUDP uint64 = 1 << 63
+	// ConnIDValueMask extracts the actual connection ID value
+	ConnIDValueMask uint64 = ^ConnIDProtocolUDP
+)
+
+// MakeUDPConnID creates a UDP-flagged connection ID
+func MakeUDPConnID(id uint64) uint64 {
+	return id | ConnIDProtocolUDP
+}
+
+// IsUDPConnID checks if connID represents a UDP connection
+func IsUDPConnID(connID uint64) bool {
+	return connID&ConnIDProtocolUDP != 0
+}
+
+// GetConnIDValue extracts the actual connection ID value (without protocol flag)
+func GetConnIDValue(connID uint64) uint64 {
+	return connID & ConnIDValueMask
+}
+
 var (
 	// ErrPayloadTooLarge is returned when payload exceeds MaxPayloadSize.
 	ErrPayloadTooLarge = errors.New("payload too large")
@@ -124,5 +148,31 @@ func NewPingMessage() *Message {
 func NewPongMessage() *Message {
 	return &Message{
 		Type: MsgPong,
+	}
+}
+
+// NewUDPConnectMessage creates a UDP connect message with client address payload.
+func NewUDPConnectMessage(connID uint64, clientAddr string) *Message {
+	return &Message{
+		Type:    MsgConnect,
+		ConnID:  MakeUDPConnID(connID),
+		Payload: []byte(clientAddr),
+	}
+}
+
+// NewUDPDataMessage creates a UDP data message.
+func NewUDPDataMessage(connID uint64, data []byte) *Message {
+	return &Message{
+		Type:    MsgData,
+		ConnID:  MakeUDPConnID(connID),
+		Payload: data,
+	}
+}
+
+// NewUDPCloseMessage creates a UDP close message.
+func NewUDPCloseMessage(connID uint64) *Message {
+	return &Message{
+		Type:   MsgClose,
+		ConnID: MakeUDPConnID(connID),
 	}
 }
