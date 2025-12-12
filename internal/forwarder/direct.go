@@ -9,18 +9,15 @@ import (
 	"time"
 
 	"github.com/orris-inc/orris-client/internal/forward"
-
 	"github.com/orris-inc/orris-client/internal/logger"
 )
 
-// DirectChainForwarder handles direct chain forwarding without WS tunnel.
-// It supports TCP and UDP protocols with direct TCP/UDP connections between hops.
-type DirectChainForwarder struct {
-	rule    *forward.Rule
-	traffic *TrafficCounter
-
+// DirectForwarder handles direct forwarding (local port -> target).
+type DirectForwarder struct {
+	rule        *forward.Rule
 	tcpListener net.Listener
 	udpConn     *net.UDPConn
+	traffic     *TrafficCounter
 
 	// UDP client tracking for response routing
 	udpClientsMu sync.RWMutex
@@ -31,38 +28,18 @@ type DirectChainForwarder struct {
 	wg     sync.WaitGroup
 }
 
-// NewDirectChainForwarder creates a new direct chain forwarder.
-func NewDirectChainForwarder(rule *forward.Rule) *DirectChainForwarder {
-	return &DirectChainForwarder{
+// NewDirectForwarder creates a new direct forwarder.
+func NewDirectForwarder(rule *forward.Rule) *DirectForwarder {
+	return &DirectForwarder{
 		rule:       rule,
 		traffic:    &TrafficCounter{},
 		udpClients: make(map[string]*udpClient),
 	}
 }
 
-// Start starts the direct chain forwarder.
-func (f *DirectChainForwarder) Start(ctx context.Context) error {
+// Start starts the direct forwarder.
+func (f *DirectForwarder) Start(ctx context.Context) error {
 	f.ctx, f.cancel = context.WithCancel(ctx)
-
-	// Log rule details for debugging
-	logger.Debug("direct chain rule details",
-		"rule_id", f.rule.ID,
-		"role", f.rule.Role,
-		"is_last_in_chain", f.rule.IsLastInChain,
-		"next_hop_address", f.rule.NextHopAddress,
-		"next_hop_port", f.rule.NextHopPort,
-		"target_address", f.rule.TargetAddress,
-		"target_port", f.rule.TargetPort)
-
-	// Determine next hop address
-	var nextHop string
-	if f.rule.IsLastInChain {
-		// Exit node: connect to final target
-		nextHop = net.JoinHostPort(f.rule.TargetAddress, fmt.Sprintf("%d", f.rule.TargetPort))
-	} else {
-		// Entry or Relay: connect to next hop
-		nextHop = net.JoinHostPort(f.rule.NextHopAddress, fmt.Sprintf("%d", f.rule.NextHopPort))
-	}
 
 	protocol := f.rule.Protocol
 	if protocol == "" {
@@ -71,18 +48,18 @@ func (f *DirectChainForwarder) Start(ctx context.Context) error {
 
 	switch protocol {
 	case "tcp":
-		if err := f.startTCP(nextHop); err != nil {
+		if err := f.startTCP(); err != nil {
 			return err
 		}
 	case "udp":
-		if err := f.startUDP(nextHop); err != nil {
+		if err := f.startUDP(); err != nil {
 			return err
 		}
 	case "both":
-		if err := f.startTCP(nextHop); err != nil {
+		if err := f.startTCP(); err != nil {
 			return err
 		}
-		if err := f.startUDP(nextHop); err != nil {
+		if err := f.startUDP(); err != nil {
 			f.tcpListener.Close()
 			return err
 		}
@@ -90,18 +67,17 @@ func (f *DirectChainForwarder) Start(ctx context.Context) error {
 		return fmt.Errorf("unsupported protocol: %s", protocol)
 	}
 
-	logger.Info("direct chain forwarder started",
+	logger.Info("direct forwarder started",
 		"rule_id", f.rule.ID,
 		"listen_port", f.rule.ListenPort,
-		"next_hop", nextHop,
-		"protocol", protocol,
-		"role", f.rule.Role)
+		"target", fmt.Sprintf("%s:%d", f.rule.TargetAddress, f.rule.TargetPort),
+		"protocol", protocol)
 
 	return nil
 }
 
-// startTCP starts the TCP listener and accept loop.
-func (f *DirectChainForwarder) startTCP(nextHop string) error {
+// startTCP starts the TCP listener.
+func (f *DirectForwarder) startTCP() error {
 	addr := fmt.Sprintf(":%d", f.rule.ListenPort)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -110,13 +86,13 @@ func (f *DirectChainForwarder) startTCP(nextHop string) error {
 	f.tcpListener = listener
 
 	f.wg.Add(1)
-	go f.tcpAcceptLoop(nextHop)
+	go f.tcpAcceptLoop()
 
 	return nil
 }
 
 // startUDP starts the UDP listener.
-func (f *DirectChainForwarder) startUDP(nextHop string) error {
+func (f *DirectForwarder) startUDP() error {
 	addr := fmt.Sprintf(":%d", f.rule.ListenPort)
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -130,22 +106,20 @@ func (f *DirectChainForwarder) startUDP(nextHop string) error {
 	f.udpConn = conn
 
 	f.wg.Add(2)
-	go f.udpReadLoop(nextHop)
+	go f.udpReadLoop()
 	go f.udpCleanupLoop()
 
 	return nil
 }
 
-// Stop stops the direct chain forwarder.
-func (f *DirectChainForwarder) Stop() error {
+// Stop stops the direct forwarder.
+func (f *DirectForwarder) Stop() error {
 	if f.cancel != nil {
 		f.cancel()
 	}
-
 	if f.tcpListener != nil {
 		f.tcpListener.Close()
 	}
-
 	if f.udpConn != nil {
 		f.udpConn.Close()
 	}
@@ -161,22 +135,21 @@ func (f *DirectChainForwarder) Stop() error {
 	f.udpClientsMu.Unlock()
 
 	f.wg.Wait()
-	logger.Info("direct chain forwarder stopped", "rule_id", f.rule.ID)
+	logger.Info("direct forwarder stopped", "rule_id", f.rule.ID)
 	return nil
 }
 
 // Traffic returns the traffic counter.
-func (f *DirectChainForwarder) Traffic() *TrafficCounter {
+func (f *DirectForwarder) Traffic() *TrafficCounter {
 	return f.traffic
 }
 
 // RuleID returns the rule ID.
-func (f *DirectChainForwarder) RuleID() string {
+func (f *DirectForwarder) RuleID() string {
 	return f.rule.ID
 }
 
-// tcpAcceptLoop accepts TCP connections and handles them.
-func (f *DirectChainForwarder) tcpAcceptLoop(nextHop string) {
+func (f *DirectForwarder) tcpAcceptLoop() {
 	defer f.wg.Done()
 
 	for {
@@ -187,61 +160,51 @@ func (f *DirectChainForwarder) tcpAcceptLoop(nextHop string) {
 				return
 			default:
 				if !isClosedError(err) {
-					logger.Error("direct chain tcp accept error", "error", err)
+					logger.Error("direct tcp accept error", "error", err)
 				}
 				continue
 			}
 		}
 
 		f.wg.Add(1)
-		go f.handleTCPConn(conn, nextHop)
+		go f.handleTCPConn(conn)
 	}
 }
 
-// handleTCPConn handles a single TCP connection.
-func (f *DirectChainForwarder) handleTCPConn(clientConn net.Conn, nextHop string) {
+func (f *DirectForwarder) handleTCPConn(clientConn net.Conn) {
 	defer f.wg.Done()
 	defer clientConn.Close()
 
-	// Connect to next hop with optional bind IP
+	targetAddr := net.JoinHostPort(f.rule.TargetAddress, fmt.Sprintf("%d", f.rule.TargetPort))
+
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	if f.rule.BindIP != "" {
 		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(f.rule.BindIP)}
 	}
 
-	upstreamConn, err := dialer.Dial("tcp", nextHop)
+	targetConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
-		logger.Error("direct chain tcp dial failed",
-			"rule_id", f.rule.ID,
-			"next_hop", nextHop,
-			"bind_ip", f.rule.BindIP,
-			"error", err)
+		logger.Error("direct tcp dial target failed", "target", targetAddr, "bind_ip", f.rule.BindIP, "error", err)
 		return
 	}
-	defer upstreamConn.Close()
-
-	logger.Debug("direct chain tcp connection established",
-		"rule_id", f.rule.ID,
-		"client", clientConn.RemoteAddr(),
-		"next_hop", nextHop)
+	defer targetConn.Close()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Client -> Upstream (upload)
-	// Use copyWithTraffic for better backpressure propagation via splice(2)
+	// Client -> Target (upload)
 	go func() {
 		defer wg.Done()
-		copyWithTraffic(upstreamConn, clientConn, f.traffic.AddUpload)
-		if tc, ok := upstreamConn.(*net.TCPConn); ok {
+		copyBuffer(f.ctx, targetConn, clientConn, f.traffic.AddUpload)
+		if tc, ok := targetConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
 	}()
 
-	// Upstream -> Client (download)
+	// Target -> Client (download)
 	go func() {
 		defer wg.Done()
-		copyWithTraffic(clientConn, upstreamConn, f.traffic.AddDownload)
+		copyBuffer(f.ctx, clientConn, targetConn, f.traffic.AddDownload)
 		if tc, ok := clientConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -250,11 +213,12 @@ func (f *DirectChainForwarder) handleTCPConn(clientConn net.Conn, nextHop string
 	wg.Wait()
 }
 
-// udpReadLoop reads UDP packets and forwards them.
-func (f *DirectChainForwarder) udpReadLoop(nextHop string) {
+// udpReadLoop reads UDP packets and forwards them to the target.
+func (f *DirectForwarder) udpReadLoop() {
 	defer f.wg.Done()
 
-	buf := make([]byte, 65535) // max UDP packet size
+	targetAddr := net.JoinHostPort(f.rule.TargetAddress, fmt.Sprintf("%d", f.rule.TargetPort))
+	buf := make([]byte, udpMaxPacketSize)
 
 	for {
 		select {
@@ -266,7 +230,7 @@ func (f *DirectChainForwarder) udpReadLoop(nextHop string) {
 		n, clientAddr, err := f.udpConn.ReadFromUDP(buf)
 		if err != nil {
 			if !isClosedError(err) && f.ctx.Err() == nil {
-				logger.Error("direct chain udp read error", "error", err)
+				logger.Error("direct udp read error", "error", err)
 			}
 			continue
 		}
@@ -274,7 +238,7 @@ func (f *DirectChainForwarder) udpReadLoop(nextHop string) {
 		f.traffic.AddUpload(int64(n))
 
 		// Get or create upstream connection for this client
-		client := f.getOrCreateUDPClient(clientAddr, nextHop)
+		client := f.getOrCreateUDPClient(clientAddr, targetAddr)
 		if client == nil {
 			continue
 		}
@@ -282,16 +246,14 @@ func (f *DirectChainForwarder) udpReadLoop(nextHop string) {
 		// Forward packet to upstream
 		_, err = client.upstream.Write(buf[:n])
 		if err != nil {
-			logger.Debug("direct chain udp write to upstream failed",
-				"client", clientAddr,
-				"error", err)
+			logger.Debug("direct udp write to target failed", "client", clientAddr, "error", err)
 			f.removeUDPClient(clientAddr.String())
 		}
 	}
 }
 
 // getOrCreateUDPClient gets or creates a UDP client connection.
-func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nextHop string) *udpClient {
+func (f *DirectForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, targetAddr string) *udpClient {
 	key := clientAddr.String()
 
 	f.udpClientsMu.RLock()
@@ -304,11 +266,9 @@ func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nex
 	}
 
 	// Create new upstream connection with optional bind IP
-	upstreamAddr, err := net.ResolveUDPAddr("udp", nextHop)
+	upstreamAddr, err := net.ResolveUDPAddr("udp", targetAddr)
 	if err != nil {
-		logger.Error("direct chain resolve upstream addr failed",
-			"next_hop", nextHop,
-			"error", err)
+		logger.Error("direct resolve upstream addr failed", "target", targetAddr, "error", err)
 		return nil
 	}
 
@@ -319,10 +279,7 @@ func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nex
 
 	upstream, err := net.DialUDP("udp", localAddr, upstreamAddr)
 	if err != nil {
-		logger.Error("direct chain udp dial upstream failed",
-			"next_hop", nextHop,
-			"bind_ip", f.rule.BindIP,
-			"error", err)
+		logger.Error("direct udp dial target failed", "target", targetAddr, "bind_ip", f.rule.BindIP, "error", err)
 		return nil
 	}
 
@@ -340,19 +297,16 @@ func (f *DirectChainForwarder) getOrCreateUDPClient(clientAddr *net.UDPAddr, nex
 	f.wg.Add(1)
 	go f.udpUpstreamReadLoop(client)
 
-	logger.Debug("direct chain udp client created",
-		"rule_id", f.rule.ID,
-		"client", clientAddr,
-		"next_hop", nextHop)
+	logger.Debug("direct udp client created", "rule_id", f.rule.ID, "client", clientAddr, "target", targetAddr)
 
 	return client
 }
 
 // udpUpstreamReadLoop reads responses from upstream and sends to client.
-func (f *DirectChainForwarder) udpUpstreamReadLoop(client *udpClient) {
+func (f *DirectForwarder) udpUpstreamReadLoop(client *udpClient) {
 	defer f.wg.Done()
 
-	buf := make([]byte, 65535)
+	buf := make([]byte, udpMaxPacketSize)
 
 	for {
 		select {
@@ -369,9 +323,7 @@ func (f *DirectChainForwarder) udpUpstreamReadLoop(client *udpClient) {
 				continue
 			}
 			if err != io.EOF && !isClosedError(err) && f.ctx.Err() == nil {
-				logger.Debug("direct chain udp upstream read error",
-					"client", client.clientAddr,
-					"error", err)
+				logger.Debug("direct udp upstream read error", "client", client.clientAddr, "error", err)
 			}
 			f.removeUDPClient(client.clientAddr.String())
 			return
@@ -383,43 +335,38 @@ func (f *DirectChainForwarder) udpUpstreamReadLoop(client *udpClient) {
 		// Send response back to client
 		_, err = f.udpConn.WriteToUDP(buf[:n], client.clientAddr)
 		if err != nil {
-			logger.Debug("direct chain udp write to client failed",
-				"client", client.clientAddr,
-				"error", err)
+			logger.Debug("direct udp write to client failed", "client", client.clientAddr, "error", err)
 		}
 	}
 }
 
 // udpCleanupLoop periodically cleans up idle UDP clients.
-func (f *DirectChainForwarder) udpCleanupLoop() {
+func (f *DirectForwarder) udpCleanupLoop() {
 	defer f.wg.Done()
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(udpCleanupInterval)
 	defer ticker.Stop()
-
-	idleTimeout := 2 * time.Minute
 
 	for {
 		select {
 		case <-f.ctx.Done():
 			return
 		case <-ticker.C:
-			f.cleanupIdleUDPClients(idleTimeout)
+			f.cleanupIdleUDPClients()
 		}
 	}
 }
 
 // cleanupIdleUDPClients removes idle UDP clients.
-func (f *DirectChainForwarder) cleanupIdleUDPClients(timeout time.Duration) {
+func (f *DirectForwarder) cleanupIdleUDPClients() {
 	now := time.Now()
 
 	f.udpClientsMu.Lock()
 	defer f.udpClientsMu.Unlock()
 
 	for key, client := range f.udpClients {
-		if now.Sub(client.lastActive) > timeout {
-			logger.Debug("direct chain removing idle udp client",
-				"client", client.clientAddr)
+		if now.Sub(client.lastActive) > udpIdleTimeout {
+			logger.Debug("direct removing idle udp client", "client", client.clientAddr)
 			client.upstream.Close()
 			delete(f.udpClients, key)
 		}
@@ -427,7 +374,7 @@ func (f *DirectChainForwarder) cleanupIdleUDPClients(timeout time.Duration) {
 }
 
 // removeUDPClient removes a UDP client by key.
-func (f *DirectChainForwarder) removeUDPClient(key string) {
+func (f *DirectForwarder) removeUDPClient(key string) {
 	f.udpClientsMu.Lock()
 	defer f.udpClientsMu.Unlock()
 
