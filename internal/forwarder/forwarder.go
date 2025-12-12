@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/orris-inc/orris/sdk/forward"
+	"github.com/orris-inc/orris-client/internal/forward"
 
 	"github.com/orris-inc/orris-client/internal/logger"
 	"github.com/orris-inc/orris-client/internal/tunnel"
@@ -22,7 +22,8 @@ func isClosedError(err error) bool {
 }
 
 // bufferSize is the size of the buffer used for copying data.
-const bufferSize = 32 * 1024
+// Using 64KB to match WebSocket buffer size for better throughput.
+const bufferSize = 64 * 1024
 
 // UDP constants
 const (
@@ -110,6 +111,117 @@ type Forwarder interface {
 	Stop() error
 	Traffic() *TrafficCounter
 	RuleID() string
+}
+
+// writeQueueSize is the buffer size for async write queue.
+// Large enough to absorb bursts without blocking the tunnel read loop.
+// 2048 entries should handle most speed test scenarios.
+const writeQueueSize = 2048
+
+// maxBatchSize is the maximum number of buffers to batch in a single writev call.
+const maxBatchSize = 64
+
+// ErrQueueFull is returned when the write queue is full.
+var ErrQueueFull = errors.New("write queue full")
+
+// connState manages async write queue for a connection.
+// It completely decouples the tunnel read loop from connection writes.
+// The tunnel read loop dispatches data to the queue (non-blocking),
+// and an independent goroutine processes the queue.
+type connState struct {
+	conn      net.Conn
+	queue     chan []byte
+	closed    atomic.Bool
+	closeOnce sync.Once
+	trafficFn func(int64)
+}
+
+// newConnState creates a new connection state with async write loop.
+func newConnState(conn net.Conn, trafficFn func(int64)) *connState {
+	cs := &connState{
+		conn:      conn,
+		queue:     make(chan []byte, writeQueueSize),
+		trafficFn: trafficFn,
+	}
+	go cs.writeLoop()
+	return cs
+}
+
+// writeLoop processes the write queue with batch optimization.
+// It uses writev (via net.Buffers) to combine multiple small writes
+// into a single system call for better performance.
+func (cs *connState) writeLoop() {
+	bufs := make(net.Buffers, 0, maxBatchSize)
+
+	for {
+		// Wait for first data
+		data, ok := <-cs.queue
+		if !ok {
+			return
+		}
+		bufs = append(bufs, data)
+
+		// Non-blocking batch: collect more data if available
+	drain:
+		for len(bufs) < maxBatchSize {
+			select {
+			case data, ok := <-cs.queue:
+				if !ok {
+					break drain
+				}
+				bufs = append(bufs, data)
+			default:
+				break drain
+			}
+		}
+
+		// Batch write using writev
+		n, err := bufs.WriteTo(cs.conn)
+		if cs.trafficFn != nil && n > 0 {
+			cs.trafficFn(n)
+		}
+		if err != nil {
+			cs.closed.Store(true)
+			return
+		}
+
+		// Reset for next batch
+		bufs = bufs[:0]
+	}
+}
+
+// Write queues data for async write. Non-blocking to prevent head-of-line blocking.
+// With a large queue (2048), this should handle most burst scenarios.
+func (cs *connState) Write(data []byte) error {
+	if cs.closed.Load() {
+		return net.ErrClosed
+	}
+
+	// Copy data since the original buffer may be reused
+	buf := make([]byte, len(data))
+	copy(buf, data)
+
+	// Non-blocking send - never block the tunnel read loop
+	select {
+	case cs.queue <- buf:
+		return nil
+	default:
+		return ErrQueueFull
+	}
+}
+
+// Close closes the connection and write queue.
+func (cs *connState) Close() {
+	cs.closeOnce.Do(func() {
+		cs.closed.Store(true)
+		close(cs.queue)
+		cs.conn.Close()
+	})
+}
+
+// IsClosed returns true if the connection is closed.
+func (cs *connState) IsClosed() bool {
+	return cs.closed.Load()
 }
 
 // TrafficCounter tracks upload and download bytes.
@@ -516,7 +628,7 @@ type EntryForwarder struct {
 
 	tunnel tunnel.Sender
 	connMu sync.RWMutex
-	conns  map[uint64]net.Conn // connID -> TCP client connection
+	conns  map[uint64]*connState // connID -> TCP client connection state (async write)
 
 	// UDP client tracking: clientAddr -> connID mapping
 	udpClientsMu sync.RWMutex
@@ -535,7 +647,7 @@ func NewEntryForwarder(rule *forward.Rule, t tunnel.Sender) *EntryForwarder {
 		rule:       rule,
 		tunnel:     t,
 		traffic:    &TrafficCounter{},
-		conns:      make(map[uint64]net.Conn),
+		conns:      make(map[uint64]*connState),
 		udpClients: make(map[string]uint64),
 		udpConnIDs: make(map[uint64]*net.UDPAddr),
 	}
@@ -629,10 +741,10 @@ func (f *EntryForwarder) Stop() error {
 
 	// Close all TCP connections
 	f.connMu.Lock()
-	for _, conn := range f.conns {
-		conn.Close()
+	for _, cs := range f.conns {
+		cs.Close()
 	}
-	f.conns = make(map[uint64]net.Conn)
+	f.conns = make(map[uint64]*connState)
 	f.connMu.Unlock()
 
 	// Clear UDP client mappings
@@ -680,6 +792,7 @@ func (f *EntryForwarder) HandleConnectWithPayload(connID uint64, payload []byte)
 }
 
 // HandleData handles data received from tunnel (exit -> entry -> client).
+// Uses async write queue to prevent blocking the tunnel read loop.
 func (f *EntryForwarder) HandleData(connID uint64, data []byte) {
 	// Check if this is a UDP connection
 	if tunnel.IsUDPConnID(connID) {
@@ -687,22 +800,26 @@ func (f *EntryForwarder) HandleData(connID uint64, data []byte) {
 		return
 	}
 
-	// TCP connection
+	// TCP connection - use async write
 	f.connMu.RLock()
-	conn, ok := f.conns[connID]
+	cs, ok := f.conns[connID]
 	f.connMu.RUnlock()
 
-	if !ok {
+	if !ok || cs.IsClosed() {
 		return
 	}
 
-	n, err := conn.Write(data)
-	if err != nil {
-		logger.Debug("entry write to tcp client failed", "conn_id", connID, "error", err)
-		f.closeTCPConn(connID)
-		return
+	if err := cs.Write(data); err != nil {
+		if errors.Is(err, ErrQueueFull) {
+			// Queue full - client is reading too slow, log but don't close immediately
+			// This prevents premature connection closure during speed tests
+			logger.Warn("entry write queue full, dropping data", "conn_id", connID, "len", len(data))
+		} else {
+			logger.Debug("entry async write to tcp client failed", "conn_id", connID, "error", err)
+			f.closeTCPConn(connID)
+		}
 	}
-	f.traffic.AddDownload(int64(n))
+	// Note: traffic is counted in connState.writeLoop after actual write
 }
 
 // handleUDPData handles UDP data from tunnel and sends to client.
@@ -760,8 +877,11 @@ func (f *EntryForwarder) handleTCPConn(clientConn net.Conn) {
 
 	connID := f.nextConnID.Add(1)
 
+	// Create connState with async write queue for download direction
+	cs := newConnState(clientConn, f.traffic.AddDownload)
+
 	f.connMu.Lock()
-	f.conns[connID] = clientConn
+	f.conns[connID] = cs
 	f.connMu.Unlock()
 
 	defer f.closeTCPConn(connID)
@@ -803,14 +923,14 @@ func (f *EntryForwarder) handleTCPConn(clientConn net.Conn) {
 
 func (f *EntryForwarder) closeTCPConn(connID uint64) {
 	f.connMu.Lock()
-	conn, ok := f.conns[connID]
+	cs, ok := f.conns[connID]
 	if ok {
 		delete(f.conns, connID)
 	}
 	f.connMu.Unlock()
 
 	if ok {
-		conn.Close()
+		cs.Close()
 		f.tunnel.SendMessage(tunnel.NewCloseMessage(connID))
 	}
 }
@@ -902,7 +1022,7 @@ type ExitForwarder struct {
 
 	tunnel tunnel.Sender
 	connMu sync.RWMutex
-	conns  map[uint64]net.Conn // connID -> TCP target connection
+	conns  map[uint64]*connState // connID -> TCP target connection state (async write)
 
 	// UDP connections
 	udpConnsMu sync.RWMutex
@@ -918,7 +1038,7 @@ func NewExitForwarder(rule *forward.Rule) *ExitForwarder {
 	return &ExitForwarder{
 		rule:     rule,
 		traffic:  &TrafficCounter{},
-		conns:    make(map[uint64]net.Conn),
+		conns:    make(map[uint64]*connState),
 		udpConns: make(map[uint64]*udpExitClient),
 	}
 }
@@ -945,10 +1065,10 @@ func (f *ExitForwarder) Stop() error {
 
 	// Close TCP connections
 	f.connMu.Lock()
-	for _, conn := range f.conns {
-		conn.Close()
+	for _, cs := range f.conns {
+		cs.Close()
 	}
-	f.conns = make(map[uint64]net.Conn)
+	f.conns = make(map[uint64]*connState)
 	f.connMu.Unlock()
 
 	// Close UDP connections
@@ -994,8 +1114,11 @@ func (f *ExitForwarder) HandleConnect(connID uint64) {
 		return
 	}
 
+	// Create connState with async write queue for upload direction
+	cs := newConnState(targetConn, f.traffic.AddUpload)
+
 	f.connMu.Lock()
-	f.conns[connID] = targetConn
+	f.conns[connID] = cs
 	f.connMu.Unlock()
 
 	logger.Debug("exit tcp target connection established", "conn_id", connID, "target", targetAddr)
@@ -1053,6 +1176,7 @@ func (f *ExitForwarder) HandleConnectWithPayload(connID uint64, payload []byte) 
 }
 
 // HandleData handles data message from tunnel (entry -> exit -> target).
+// Uses async write queue to prevent blocking the tunnel read loop.
 func (f *ExitForwarder) HandleData(connID uint64, data []byte) {
 	// Check if this is a UDP connection
 	if tunnel.IsUDPConnID(connID) {
@@ -1060,22 +1184,25 @@ func (f *ExitForwarder) HandleData(connID uint64, data []byte) {
 		return
 	}
 
-	// TCP connection
+	// TCP connection - use async write
 	f.connMu.RLock()
-	conn, ok := f.conns[connID]
+	cs, ok := f.conns[connID]
 	f.connMu.RUnlock()
 
-	if !ok {
+	if !ok || cs.IsClosed() {
 		return
 	}
 
-	n, err := conn.Write(data)
-	if err != nil {
-		logger.Debug("exit write to tcp target failed", "conn_id", connID, "error", err)
-		f.closeTCPConn(connID)
-		return
+	if err := cs.Write(data); err != nil {
+		if errors.Is(err, ErrQueueFull) {
+			// Queue full - target is accepting too slow, log but don't close immediately
+			logger.Warn("exit write queue full, dropping data", "conn_id", connID, "len", len(data))
+		} else {
+			logger.Debug("exit async write to tcp target failed", "conn_id", connID, "error", err)
+			f.closeTCPConn(connID)
+		}
 	}
-	f.traffic.AddUpload(int64(n))
+	// Note: traffic is counted in connState.writeLoop after actual write
 }
 
 // handleUDPData handles UDP data from tunnel and forwards to target.
@@ -1185,14 +1312,14 @@ func (f *ExitForwarder) udpUpstreamReadLoop(connID uint64, client *udpExitClient
 
 func (f *ExitForwarder) closeTCPConn(connID uint64) {
 	f.connMu.Lock()
-	conn, ok := f.conns[connID]
+	cs, ok := f.conns[connID]
 	if ok {
 		delete(f.conns, connID)
 	}
 	f.connMu.Unlock()
 
 	if ok {
-		conn.Close()
+		cs.Close()
 		if f.tunnel != nil {
 			f.tunnel.SendMessage(tunnel.NewCloseMessage(connID))
 		}
