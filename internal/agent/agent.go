@@ -943,6 +943,7 @@ func ruleSyncDataToRule(data *forward.RuleSyncData) *forward.Rule {
 		ListenPort:     data.ListenPort,
 		TargetAddress:  data.TargetAddress,
 		TargetPort:     data.TargetPort,
+		BindIP:         data.BindIP,
 		Protocol:       data.Protocol,
 		Role:           data.Role,
 		NextHopAgentID: data.NextHopAgentID,
