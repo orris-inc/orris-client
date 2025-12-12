@@ -31,6 +31,29 @@ const (
 	udpCleanupInterval = 30 * time.Second
 )
 
+// trafficWriter wraps an io.Writer to count bytes written.
+// This allows using io.Copy which can leverage splice(2) for zero-copy.
+type trafficWriter struct {
+	w         io.Writer
+	trafficFn func(int64)
+}
+
+func (tw *trafficWriter) Write(p []byte) (n int, err error) {
+	n, err = tw.w.Write(p)
+	if n > 0 && tw.trafficFn != nil {
+		tw.trafficFn(int64(n))
+	}
+	return
+}
+
+// copyWithTraffic copies data from src to dst using io.Copy.
+// On Linux, this leverages splice(2) for zero-copy when both src and dst are sockets,
+// which provides better backpressure propagation in multi-hop forwarding chains.
+func copyWithTraffic(dst io.Writer, src io.Reader, trafficFn func(int64)) (int64, error) {
+	tw := &trafficWriter{w: dst, trafficFn: trafficFn}
+	return io.Copy(tw, src)
+}
+
 // bufPool is a pool of buffers used for copying data to reduce GC pressure.
 var bufPool = sync.Pool{
 	New: func() any {
@@ -42,6 +65,8 @@ var bufPool = sync.Pool{
 // copyBuffer copies data from src to dst using a pooled buffer.
 // It calls trafficFn with the number of bytes written after each write.
 // It respects context cancellation by checking ctx.Done() between reads.
+// NOTE: For multi-hop forwarding chains, consider using copyWithTraffic instead
+// for better backpressure propagation via splice(2).
 func copyBuffer(ctx context.Context, dst io.Writer, src io.Reader, trafficFn func(int64)) (int64, error) {
 	bufp := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bufp)

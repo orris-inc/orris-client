@@ -226,9 +226,10 @@ func (f *DirectChainForwarder) handleTCPConn(clientConn net.Conn, nextHop string
 	wg.Add(2)
 
 	// Client -> Upstream (upload)
+	// Use copyWithTraffic for better backpressure propagation via splice(2)
 	go func() {
 		defer wg.Done()
-		copyBuffer(f.ctx, upstreamConn, clientConn, f.traffic.AddUpload)
+		copyWithTraffic(upstreamConn, clientConn, f.traffic.AddUpload)
 		if tc, ok := upstreamConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -237,7 +238,7 @@ func (f *DirectChainForwarder) handleTCPConn(clientConn net.Conn, nextHop string
 	// Upstream -> Client (download)
 	go func() {
 		defer wg.Done()
-		copyBuffer(f.ctx, clientConn, upstreamConn, f.traffic.AddDownload)
+		copyWithTraffic(clientConn, upstreamConn, f.traffic.AddDownload)
 		if tc, ok := clientConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
