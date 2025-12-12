@@ -4,7 +4,7 @@ go 1.24.3
 
 require github.com/spf13/pflag v1.0.10
 
-require github.com/orris-inc/orris/sdk/forward v0.0.0-20251212104719-2204a51108d5
+require github.com/orris-inc/orris/sdk/forward v0.0.0-20251212111032-4aa80020c826
 
 require (
 	github.com/gorilla/websocket v1.5.3
